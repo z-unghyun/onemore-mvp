@@ -1,11 +1,12 @@
 // ─── config ──────────────────────────────────────────────────────────────────
 
-const API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_KEY || '';
-const BASE = 'https://maps.googleapis.com/maps/api';
+// All Google API calls go through the server-side proxy at /api/places, which
+// injects the key (server-only env var GOOGLE_MAPS_KEY). The client never sees
+// the key. When no key is configured the proxy returns { status: 'NO_API_KEY' }
+// and each function falls back to its mock/default behaviour.
 
 async function gCall(path: string): Promise<Record<string, unknown>> {
-  const url = `${BASE}${path}&key=${API_KEY}`;
-  const res = await fetch(`/api/places?url=${encodeURIComponent(url)}`);
+  const res = await fetch(`/api/places?path=${encodeURIComponent(path)}`);
   return res.json();
 }
 
@@ -85,7 +86,6 @@ const walkCache = new Map<string, number>();
 // ─── 1. Place Autocomplete ────────────────────────────────────────────────────
 
 export async function autocompleteRegion(input: string): Promise<RegionSuggestion[]> {
-  if (!API_KEY) return [];
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const data: any = await gCall(
@@ -108,8 +108,6 @@ export async function findNearest(
   category: string | null,
   kind: string,
 ): Promise<CoursePlace | null> {
-  if (!API_KEY) return null;
-
   const { type, keyword } = (category && CAT_PARAMS[category])
     ? CAT_PARAMS[category]
     : KIND_DEFAULT[kind] ?? { type: 'restaurant', keyword: '' };
@@ -201,8 +199,6 @@ export async function getWalkingTimes(
     return cacheKeys.map(k => walkCache.get(k)!);
   }
 
-  if (!API_KEY) return pairs.map(() => 5);
-
   try {
     const origins      = places.slice(0, -1).map(p => `${p.lat},${p.lng}`).join('|');
     const destinations = places.slice(1).map(p => `${p.lat},${p.lng}`).join('|');
@@ -217,11 +213,12 @@ export async function getWalkingTimes(
 
     return pairs.map((pair, i) => {
       const el = rows[i]?.elements[i];
-      const mins = el?.status === 'OK'
-        ? Math.ceil((el.duration?.value ?? 300) / 60)
-        : 5;
-      walkCache.set(cacheKeys[i], mins);
-      return mins;
+      if (el?.status === 'OK') {
+        const mins = Math.ceil((el.duration?.value ?? 300) / 60);
+        walkCache.set(cacheKeys[i], mins); // only cache real results
+        return mins;
+      }
+      return 5; // fallback (no key / no route) — not cached, retried when key present
     });
   } catch {
     return pairs.map(() => 5);
@@ -232,11 +229,14 @@ export async function getWalkingTimes(
 
 export async function nearbySearch(
   lat: number, lng: number,
-  type: string, keyword: string,
+  category: string, keyword: string,
 ): Promise<PlaceCandidate[]> {
-  if (!API_KEY) return [];
   try {
-    const kwParam = keyword ? `&keyword=${encodeURIComponent(keyword)}` : '';
+    // category 는 한글 분류(예: '디저트')일 수 있으므로 Google type/keyword 로 변환
+    const mapped = CAT_PARAMS[category];
+    const type = mapped?.type ?? 'restaurant';
+    const kw = mapped?.keyword || keyword;
+    const kwParam = kw ? `&keyword=${encodeURIComponent(kw)}` : '';
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const data: any = await gCall(
       `/place/nearbysearch/json?location=${lat},${lng}&rankby=distance&type=${type}${kwParam}&language=ko`
@@ -261,7 +261,6 @@ export async function getWalkingMinutes(
   origin: { lat: number; lng: number },
   destination: { lat: number; lng: number },
 ): Promise<number> {
-  if (!API_KEY) return 5;
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const data: any = await gCall(
@@ -274,5 +273,6 @@ export async function getWalkingMinutes(
 // ─── 7. Photo URL ─────────────────────────────────────────────────────────────
 
 export function photoUrl(ref: string, maxWidth = 400): string {
-  return `${BASE}/place/photo?maxwidth=${maxWidth}&photo_reference=${ref}&key=${API_KEY}`;
+  // Routed through the server proxy so the key is never exposed client-side.
+  return `/api/places/photo?ref=${encodeURIComponent(ref)}&w=${maxWidth}`;
 }
