@@ -6,7 +6,7 @@ import {
   CAT, NAMES, KIND, PRICE, INITIAL_ITEMS, COUPLE_NAME, REGIONS, REGION_COORDS,
 } from '@/lib/constants';
 import type { TimelineItem } from '@/lib/types';
-import { autocompleteRegion, nearbySearch, getWalkingMinutes } from '@/lib/places';
+import { autocompleteRegion, nearbySearch, recommendCourse, getWalkingTimes } from '@/lib/places';
 import type { RegionSuggestion, PlaceCandidate } from '@/lib/places';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -69,6 +69,7 @@ export default function App() {
   const [searchSuggestions, setSearchSuggestions] = useState<RegionSuggestion[]>([]);
   const [swapCandidates, setSwapCandidates] = useState<PlaceCandidate[]>([]);
   const [walkMins, setWalkMins] = useState<number[]>(WALKS);
+  const [isRecommending, setIsRecommending] = useState(false);
 
   const toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const mapDragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
@@ -90,15 +91,15 @@ export default function App() {
     return () => clearTimeout(t);
   }, [searchInput]);
 
-  // real walk times when places have coordinates
+  // batch walk times when places have coordinates
   useEffect(() => {
     const sorted = [...items].sort((a, b) => a.start - b.start);
     if (sorted.length < 2) return;
     if (!sorted.every(it => it.lat && it.lng)) return;
-    const pairs = sorted.slice(1).map((it, i) => ({ a: sorted[i], b: it }));
-    Promise.all(pairs.map(p =>
-      getWalkingMinutes({ lat: p.a.lat!, lng: p.a.lng! }, { lat: p.b.lat!, lng: p.b.lng! })
-    )).then(mins => setWalkMins(mins.map((m, i) => m || WALKS[i])));
+    const places = sorted.map(it => ({ placeId: it.placeId ?? String(it.id), lat: it.lat!, lng: it.lng! }));
+    getWalkingTimes(places).then(mins => {
+      if (mins.length) setWalkMins(mins.map((m, i) => m || WALKS[i]));
+    });
   }, [items]);
 
   // fetch swap candidates from Nearby Search
@@ -436,7 +437,28 @@ export default function App() {
                 </div>
               </div>
               <div style={{ padding: '0 18px 92px' }}>
-                <button onClick={() => { if (items.length === 0) { setShowSearch(true); return; } setPlanStage('final'); }} style={{ width: '100%', background: '#FF5C97', color: '#fff', border: 'none', borderRadius: 18, padding: 17, fontWeight: 800, fontSize: 16, cursor: 'pointer', boxShadow: '0 14px 30px -12px rgba(240,86,140,.65)' }}>계획 짜기</button>
+                <button
+                  disabled={isRecommending}
+                  onClick={async () => {
+                    if (items.length === 0) { setShowSearch(true); return; }
+                    setIsRecommending(true);
+                    try {
+                      const courseItems = [...items].sort((a, b) => a.start - b.start).map(it => ({ id: it.id, kind: it.kind, category: it.category }));
+                      const placeMap = await recommendCourse(courseItems, region);
+                      if (placeMap.size > 0) {
+                        setItems(prev => prev.map(it => {
+                          const p = placeMap.get(it.id);
+                          if (!p) return it;
+                          return { ...it, placeId: p.placeId, placeName: p.name, lat: p.lat, lng: p.lng, placeRating: p.rating, photoRef: p.photoRef, isPartner: p.isPartner };
+                        }));
+                      }
+                    } finally {
+                      setIsRecommending(false);
+                      setPlanStage('final');
+                    }
+                  }}
+                  style={{ width: '100%', background: isRecommending ? '#F4A6C0' : '#FF5C97', color: '#fff', border: 'none', borderRadius: 18, padding: 17, fontWeight: 800, fontSize: 16, cursor: isRecommending ? 'default' : 'pointer', boxShadow: '0 14px 30px -12px rgba(240,86,140,.65)', transition: 'background .2s' }}
+                >{isRecommending ? '코스 추천 중…' : '계획 짜기'}</button>
               </div>
             </div>
           )}
