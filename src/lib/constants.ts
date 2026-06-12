@@ -54,4 +54,20 @@ export const INITIAL_ITEMS: TimelineItem[] = [
 
 export const COUPLE_NAME = '민준 ♥ 서연';
 
-export const REGIONS = ['강남', '을지로3가', '성수', '홍대', '한남', '연남'];
+export const REGIONS: Array<{ name: string; sub: string }> = [
+  { name: '강남',    sub: '다이닝 · 루프톱 핫플' },
+  { name: '을지로3가', sub: '노포 · 힙한 골목' },
+  { name: '성수',    sub: '카페 · 편집숍 천국' },
+  { name: '홍대',    sub: '공연 · 라이브 무드' },
+  { name: '한남',    sub: '갤러리 · 브런치' },
+  { name: '연남',    sub: '산책 · 데이트 코스' },
+];
+
+export const REGION_COORDS: Record<string, { lat: number; lng: number }> = {
+  '강남':    { lat: 37.4979, lng: 127.0276 },
+  '을지로3가': { lat: 37.5663, lng: 126.9931 },
+  '성수':    { lat: 37.5447, lng: 127.0557 },
+  '홍대':    { lat: 37.5543, lng: 126.9228 },
+  '한남':    { lat: 37.5344, lng: 127.0010 },
+  '연남':    { lat: 37.5593, lng: 126.9234 },
+};

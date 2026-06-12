@@ -1,40 +1,58 @@
 'use client';
 
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { HOURH, START, HOURS, DATES, WALKS, CAT, NAMES, KIND, PRICE, INITIAL_ITEMS, COUPLE_NAME, REGIONS } from '@/lib/constants';
+import {
+  HOURH, START, HOURS, ENDM, DATES, WALKS,
+  CAT, NAMES, KIND, PRICE, INITIAL_ITEMS, COUPLE_NAME, REGIONS, REGION_COORDS,
+} from '@/lib/constants';
 import type { TimelineItem } from '@/lib/types';
-import { autocompleteRegion, nearbySearch } from '@/lib/places';
+import { autocompleteRegion, nearbySearch, getWalkingMinutes } from '@/lib/places';
 import type { RegionSuggestion, PlaceCandidate } from '@/lib/places';
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-function fmtTime(m: number): string {
-  const h = Math.floor(m / 60);
-  const min = m % 60;
-  return `${h}:${min.toString().padStart(2, '0')}`;
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+function fmt(m: number) {
+  m = Math.round(m);
+  return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`;
+}
+function won(n: number) { return n.toLocaleString('ko-KR') + '원'; }
+function rateFor(cnt: number) { return Math.min(30, 5 * cnt); }
+
+function getCandidates(it: TimelineItem) {
+  const cat = it.category ?? CAT[it.kind][0];
+  const arr = NAMES[cat] ?? NAMES[CAT[it.kind][0]];
+  return arr.map((name, i) => ({ name, partner: i < 2, rating: (4.9 - i * 0.2).toFixed(1) }));
+}
+function placeName(it: TimelineItem) {
+  if (it.placeName) return it.placeName;
+  const c = getCandidates(it);
+  return c[(it.placeIdx ?? 0) % c.length].name;
+}
+function isPartner(it: TimelineItem) {
+  if (it.isPartner !== undefined) return it.isPartner;
+  const c = getCandidates(it);
+  return c[(it.placeIdx ?? 0) % c.length].partner;
+}
+function firstFreeSlot(items: TimelineItem[]) {
+  const dur = 90;
+  const sorted = [...items].sort((a, b) => a.start - b.start);
+  let s = START;
+  for (const it of sorted) { if (s < it.end && s + dur > it.start) s = it.end; }
+  return Math.min(ENDM - dur, s);
 }
 
-function getPlaceName(item: TimelineItem, region: string): string {
-  if (item.placeName) return item.placeName;
-  const list = NAMES[item.category || ''];
-  if (list) return list[item.placeIdx % 3];
-  return '장소';
-}
+const POS: [number, number][] = [[24, 30], [58, 42], [44, 66], [76, 68]];
+const KIND_ICONS: Record<string, string> = { '식사': '🍴', '카페': '☕', '놀거리': '🎢' };
 
-function getAddress(item: TimelineItem, region: string): string {
-  return `${region} 어딘가 · 도보 5분`;
-}
+// ─── App ─────────────────────────────────────────────────────────────────────
 
-function discount(n: number): number {
-  return [0, 5, 10, 15, 20][Math.min(n, 4)];
-}
-
-// ─── Main App ────────────────────────────────────────────────────────────────
 export default function App() {
+  // state mirrors the prototype exactly (tab starts on 'plan')
   const [mapPan, setMapPan] = useState({ x: 0, y: 0 });
-  const [tab, setTab] = useState<'home' | 'plan' | 'calendar' | 'mypage'>('home');
+  const [tab, setTab] = useState<'home' | 'plan' | 'calendar' | 'mypage'>('plan');
   const [planStage, setPlanStage] = useState<'build' | 'final' | 'checkout' | 'complete'>('build');
   const [region, setRegion] = useState('강남');
-  const [dateIdx, setDateIdx] = useState(0);
+  const [dateIdx, setDateIdx] = useState(1);
   const [showSearch, setShowSearch] = useState(false);
   const [catPickerId, setCatPickerId] = useState<number | null>(null);
   const [placePickerId, setPlacePickerId] = useState<number | null>(null);
@@ -45,1040 +63,813 @@ export default function App() {
   const [payIdx, setPayIdx] = useState(0);
   const [toast, setToast] = useState('');
   const [items, setItems] = useState<TimelineItem[]>(INITIAL_ITEMS);
+
+  // API state
   const [searchInput, setSearchInput] = useState('');
-  const [suggestions, setSuggestions] = useState<RegionSuggestion[]>([]);
-  const [candidates, setCandidates] = useState<PlaceCandidate[]>([]);
-  const [loadingCandidates, setLoadingCandidates] = useState(false);
+  const [searchSuggestions, setSearchSuggestions] = useState<RegionSuggestion[]>([]);
+  const [swapCandidates, setSwapCandidates] = useState<PlaceCandidate[]>([]);
+  const [walkMins, setWalkMins] = useState<number[]>(WALKS);
 
-  const dragRef = useRef<{ type: 'move' | 'resize'; id: number; startY: number; origStart: number; origEnd: number; moved: number } | null>(null);
-  const mapDragRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const mapDragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
+  const tlDragRef = useRef<{ id: number; mode: 'move' | 'resize'; startY: number; os: number; oe: number; moved: number } | null>(null);
 
-  const totalOriginal = () => items.reduce((s, i) => s + (PRICE[i.kind] || 0), 0);
-  const totalDiscount_ = () => Math.round(totalOriginal() * discount(items.length) / 100);
-  const totalFinal = () => totalOriginal() - totalDiscount_();
-
-  const showToast = useCallback((msg: string) => {
+  const flash = useCallback((msg: string) => {
     setToast(msg);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(''), 2000);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(''), 1700);
   }, []);
 
-  // ── Map pan handlers ─────────────────────────────────────────────────────
-  const onMapPointerDown = (e: React.PointerEvent) => {
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    mapDragRef.current = { startX: e.clientX, startY: e.clientY, origX: mapPan.x, origY: mapPan.y };
-  };
-  const onMapPointerMove = (e: React.PointerEvent) => {
-    if (!mapDragRef.current) return;
-    const dx = e.clientX - mapDragRef.current.startX;
-    const dy = e.clientY - mapDragRef.current.startY;
-    setMapPan({
-      x: Math.max(-160, Math.min(160, mapDragRef.current.origX + dx)),
-      y: Math.max(-160, Math.min(160, mapDragRef.current.origY + dy)),
-    });
-  };
-  const onMapPointerUp = () => { mapDragRef.current = null; };
-
-  // ── Timeline drag handlers ───────────────────────────────────────────────
-  const onTimelinePointerMove = (e: React.PointerEvent) => {
-    if (!dragRef.current) return;
-    const ref = dragRef.current;
-    const dy = e.clientY - ref.startY;
-    ref.moved = Math.abs(dy);
-    const snap = HOURH / 4; // 15 min
-    const deltaMin = Math.round(dy / snap) * 15;
-    setItems(prev => prev.map(it => {
-      if (it.id !== ref.id) return it;
-      if (ref.type === 'move') {
-        const dur = ref.origEnd - ref.origStart;
-        const newStart = Math.max(START, Math.min(1380, ref.origStart + deltaMin));
-        return { ...it, start: newStart, end: newStart + dur };
-      } else {
-        const newEnd = Math.max(ref.origStart + 30, Math.min(1500, ref.origEnd + deltaMin));
-        return { ...it, end: newEnd };
-      }
-    }));
-  };
-  const onTimelinePointerUp = () => { dragRef.current = null; };
-
-  // ── Add item ─────────────────────────────────────────────────────────────
-  const addItem = (kind: '식사' | '카페' | '놀거리') => {
-    const dur = kind === '놀거리' ? 120 : 90;
-    let start = START;
-    const sorted = [...items].sort((a, b) => a.end - b.end);
-    for (const it of sorted) {
-      if (it.end + 15 + dur <= 1500) start = it.end + 15;
-    }
-    const cat = CAT[kind][0];
-    setItems(prev => [...prev, {
-      id: Date.now(),
-      kind,
-      category: cat,
-      start,
-      end: start + dur,
-      placeIdx: 0,
-    }]);
-  };
-
-  const deleteItem = (id: number) => setItems(prev => prev.filter(i => i.id !== id));
-
-  // ── Region search ─────────────────────────────────────────────────────────
-  const onSearchChange = (val: string) => {
-    setSearchInput(val);
-    if (searchTimer.current) clearTimeout(searchTimer.current);
-    searchTimer.current = setTimeout(async () => {
-      if (val.length > 0) {
-        const res = await autocompleteRegion(val);
-        setSuggestions(res);
-      } else {
-        setSuggestions([]);
-      }
-    }, 300);
-  };
-
-  // ── Place swap ────────────────────────────────────────────────────────────
+  // autocomplete with 300ms debounce
   useEffect(() => {
-    if (placePickerId !== null) {
-      setLoadingCandidates(true);
-      setCandidates([]);
-      const item = items.find(i => i.id === placePickerId);
-      if (item && item.lat && item.lng) {
-        nearbySearch(item.lat, item.lng, item.kind, item.category || '').then(res => {
-          setCandidates(res);
-          setLoadingCandidates(false);
-        });
-      } else {
-        // Fallback to static
-        const list = NAMES[item?.category || ''] || [];
-        setCandidates(list.map((name, i) => ({
-          placeId: `static-${i}`,
-          name,
-          rating: 4.0 + Math.random() * 0.9,
-          lat: 0,
-          lng: 0,
-          isPartner: i < 2,
-        })));
-        setLoadingCandidates(false);
-      }
+    if (!searchInput.trim()) { setSearchSuggestions([]); return; }
+    const t = setTimeout(async () => {
+      const r = await autocompleteRegion(searchInput);
+      setSearchSuggestions(r);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [searchInput]);
+
+  // real walk times when places have coordinates
+  useEffect(() => {
+    const sorted = [...items].sort((a, b) => a.start - b.start);
+    if (sorted.length < 2) return;
+    if (!sorted.every(it => it.lat && it.lng)) return;
+    const pairs = sorted.slice(1).map((it, i) => ({ a: sorted[i], b: it }));
+    Promise.all(pairs.map(p =>
+      getWalkingMinutes({ lat: p.a.lat!, lng: p.a.lng! }, { lat: p.b.lat!, lng: p.b.lng! })
+    )).then(mins => setWalkMins(mins.map((m, i) => m || WALKS[i])));
+  }, [items]);
+
+  // fetch swap candidates from Nearby Search
+  useEffect(() => {
+    if (!placePickerId) { setSwapCandidates([]); return; }
+    const it = items.find(i => i.id === placePickerId);
+    if (!it) return;
+    const cat = it.category ?? CAT[it.kind][0];
+    const coords = REGION_COORDS[region];
+    if (!coords) return;
+    nearbySearch(coords.lat, coords.lng, cat, cat).then(r => { if (r.length) setSwapCandidates(r); });
+  }, [placePickerId, items, region]);
+
+  // ── map pan ────────────────────────────────────────────────────
+  const handleMapDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement).closest('button')) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const LIMIT = 160;
+    mapDragRef.current = { sx: e.clientX, sy: e.clientY, ox: mapPan.x, oy: mapPan.y };
+    const onMove = (ev: PointerEvent) => {
+      if (!mapDragRef.current) return;
+      const { sx, sy, ox, oy } = mapDragRef.current;
+      setMapPan({
+        x: Math.max(-LIMIT, Math.min(LIMIT, ox + ev.clientX - sx)),
+        y: Math.max(-LIMIT, Math.min(LIMIT, oy + ev.clientY - sy)),
+      });
+    };
+    const onUp = () => { mapDragRef.current = null; window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }, [mapPan]);
+
+  // ── timeline drag ──────────────────────────────────────────────
+  const startDrag = useCallback((e: React.PointerEvent, id: number, mode: 'move' | 'resize') => {
+    e.stopPropagation();
+    if (e.cancelable) e.preventDefault();
+    const it = items.find(i => i.id === id);
+    if (!it) return;
+    tlDragRef.current = { id, mode, startY: e.clientY, os: it.start, oe: it.end, moved: 0 };
+    const onMove = (ev: PointerEvent) => {
+      if (!tlDragRef.current) return;
+      const d = tlDragRef.current;
+      const dy = ev.clientY - d.startY;
+      d.moved = Math.max(d.moved, Math.abs(dy));
+      const dm = Math.round(dy / HOURH * 60 / 10) * 10;
+      setItems(prev => prev.map(i => {
+        if (i.id !== d.id) return i;
+        if (d.mode === 'move') {
+          const dur = d.oe - d.os;
+          const ns = Math.max(START, Math.min(ENDM - dur, d.os + dm));
+          return { ...i, start: ns, end: ns + dur };
+        }
+        return { ...i, end: Math.max(d.os + 30, Math.min(ENDM, d.oe + dm)) };
+      }));
+    };
+    const onUp = () => {
+      const d = tlDragRef.current; tlDragRef.current = null;
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      if (d && d.mode === 'move' && d.moved < 5) setCatPickerId(d.id);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }, [items]);
+
+  // ── derived ────────────────────────────────────────────────────
+  const date = DATES[dateIdx];
+  const sorted = [...items].sort((a, b) => a.start - b.start);
+  const partnerItems = sorted.filter(isPartner);
+  const partnerCount = partnerItems.length;
+  const r = rateFor(partnerCount);
+  const subtotal = sorted.reduce((a, i) => a + PRICE[i.kind], 0);
+  const discountRawN = partnerItems.reduce((a, it) => a + Math.round(PRICE[it.kind] * r / 100), 0);
+  const finalN = subtotal - discountRawN;
+
+  const isCheckout = tab === 'plan' && planStage === 'checkout';
+  const isComplete = tab === 'plan' && planStage === 'complete';
+  const showNav = !isCheckout && !isComplete && !reviewOpen;
+
+  // region display list (autocomplete results or static)
+  const displayRegions = searchSuggestions.length
+    ? searchSuggestions.map(s => ({ name: s.name, sub: s.sub, selected: region === s.name }))
+    : REGIONS.map(r => ({ name: r.name, sub: r.sub, selected: region === r.name }));
+
+  // place swap candidates
+  let placeOptions: Array<{ name: string; partner: boolean; rating: string; area: string; selected: boolean; idx: number }> = [];
+  let placePickerCat = '';
+  if (placePickerId) {
+    const it = items.find(i => i.id === placePickerId);
+    if (it) {
+      placePickerCat = it.category ?? CAT[it.kind][0];
+      const base = swapCandidates.length
+        ? swapCandidates.map((c, i) => ({ name: c.name, partner: c.isPartner, rating: c.rating.toFixed(1), idx: i }))
+        : getCandidates(it).map((c, i) => ({ ...c, idx: i }));
+      placeOptions = base.map(c => ({ ...c, area: region, selected: (it.placeIdx ?? 0) % base.length === c.idx }));
     }
-  }, [placePickerId]);
+  }
 
-  // ── Styles ────────────────────────────────────────────────────────────────
-  const phone: React.CSSProperties = {
-    position: 'relative', width: 390, height: 844, borderRadius: 40,
-    background: 'linear-gradient(180deg, #FFE0EB 0%, #DCEBFF 100%)',
-    border: '2px solid #000', overflow: 'hidden',
-    boxShadow: '0 32px 64px rgba(0,0,0,0.28)',
+  const pickRegion = (name: string) => {
+    setRegion(name);
+    setShowSearch(false);
+    setSearchInput('');
+    setSearchSuggestions([]);
   };
 
-  const scrollArea: React.CSSProperties = {
-    position: 'absolute', top: 44, left: 0, right: 0, bottom: 72, overflowY: 'auto',
-  };
-
-  // ─── Render ───────────────────────────────────────────────────────────────
-  return (
-    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#EDE7EC' }}>
-      <div style={phone}>
-        {/* Status Bar */}
-        <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 44, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 24px', zIndex: 10 }}>
-          <span style={{ fontSize: 15, fontWeight: 600 }}>9:41</span>
-          <span style={{ fontSize: 12, letterSpacing: 2 }}>●●●</span>
-        </div>
-
-        {/* Scrollable Content */}
-        <div style={scrollArea}>
-          {tab === 'home' && <HomeScreen items={items} region={region} confirmed={confirmed} mapPan={mapPan} onMapPointerDown={onMapPointerDown} onMapPointerMove={onMapPointerMove} onMapPointerUp={onMapPointerUp} onReview={() => setReviewOpen(true)} onPlan={() => { setTab('plan'); setPlanStage('build'); }} dateIdx={dateIdx} />}
-          {tab === 'plan' && planStage === 'build' && (
-            <PlanBuildScreen
-              items={items} region={region} dateIdx={dateIdx}
-              onSetDateIdx={setDateIdx}
-              onDelete={deleteItem}
-              onAdd={addItem}
-              onCatPick={setCatPickerId}
-              onNext={() => setPlanStage('final')}
-              dragRef={dragRef}
-              onTimelinePointerMove={onTimelinePointerMove}
-              onTimelinePointerUp={onTimelinePointerUp}
-              onRegionClick={() => setShowSearch(true)}
-            />
-          )}
-          {tab === 'plan' && planStage === 'final' && (
-            <PlanFinalScreen
-              items={items} region={region} dateIdx={dateIdx}
-              totalOriginal={totalOriginal()} totalDiscount={totalDiscount_()} totalFinal={totalFinal()}
-              discountPct={discount(items.length)}
-              onBack={() => setPlanStage('build')}
-              onPlacePick={setPlacePickerId}
-              onConfirm={() => { setConfirmed(true); setTab('home'); showToast('예약이 확정됐어요! 🎉'); }}
-              getPlaceName={(i) => getPlaceName(i, region)}
-              getAddress={(i) => getAddress(i, region)}
-            />
-          )}
-          {tab === 'plan' && planStage === 'checkout' && (
-            <CheckoutScreen
-              items={items} payIdx={payIdx} setPayIdx={setPayIdx}
-              totalOriginal={totalOriginal()} totalDiscount={totalDiscount_()} totalFinal={totalFinal()}
-              discountPct={discount(items.length)}
-              onBack={() => setPlanStage('final')}
-              onPay={() => { setPlanStage('complete'); setConfirmed(true); }}
-              getPlaceName={(i) => getPlaceName(i, region)}
-            />
-          )}
-          {tab === 'plan' && planStage === 'complete' && (
-            <CompleteScreen
-              items={items}
-              onHome={() => { setTab('home'); setPlanStage('build'); }}
-              onReview={() => setReviewOpen(true)}
-              getPlaceName={(i) => getPlaceName(i, region)}
-            />
-          )}
-          {tab === 'calendar' && <CalendarScreen dateIdx={dateIdx} setDateIdx={setDateIdx} region={region} />}
-          {tab === 'mypage' && <MyPageScreen />}
-        </div>
-
-        {/* Bottom Nav */}
-        <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 72, background: 'rgba(255,255,255,0.92)', backdropFilter: 'blur(12px)', borderTop: '1px solid rgba(0,0,0,0.06)', display: 'flex', alignItems: 'center', zIndex: 20 }}>
-          {([['home','홈','🏠'],['plan','계획','📋'],['calendar','캘린더','📅'],['mypage','마이','👤']] as const).map(([t, label, icon]) => (
-            <button key={t} onClick={() => setTab(t)} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, background: 'none', border: 'none', cursor: 'pointer', color: tab === t ? '#FF5C97' : '#9A96A0' }}>
-              <span style={{ fontSize: 22 }}>{icon}</span>
-              <span style={{ fontSize: 12, fontWeight: tab === t ? 600 : 400 }}>{label}</span>
-            </button>
-          ))}
-        </div>
-
-        {/* Home indicator */}
-        <div style={{ position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)', width: 134, height: 5, background: 'rgba(0,0,0,0.2)', borderRadius: 3 }} />
-
-        {/* Sheets */}
-        {showSearch && (
-          <PlaceSearchSheet
-            input={searchInput} suggestions={suggestions} onInputChange={onSearchChange}
-            onSelect={(r) => { setRegion(r); setShowSearch(false); setSearchInput(''); setSuggestions([]); }}
-            onClose={() => { setShowSearch(false); setSearchInput(''); setSuggestions([]); }}
-          />
-        )}
-        {catPickerId !== null && (() => {
-          const item = items.find(i => i.id === catPickerId);
-          if (!item) return null;
-          return (
-            <CategoryPickerSheet
-              item={item}
-              onSelect={(cat) => {
-                setItems(prev => prev.map(i => i.id === catPickerId ? { ...i, category: cat, placeIdx: 0 } : i));
-                setCatPickerId(null);
-              }}
-              onClose={() => setCatPickerId(null)}
-            />
-          );
-        })()}
-        {placePickerId !== null && (() => {
-          const item = items.find(i => i.id === placePickerId);
-          if (!item) return null;
-          return (
-            <PlaceSwapSheet
-              item={item} candidates={candidates} loading={loadingCandidates}
-              onSelect={(c) => {
-                setItems(prev => prev.map(i => i.id === placePickerId ? { ...i, placeName: c.name, placeId: c.placeId, lat: c.lat, lng: c.lng, placeRating: c.rating, photoRef: c.photoRef, isPartner: c.isPartner } : i));
-                setPlacePickerId(null);
-              }}
-              onClose={() => setPlacePickerId(null)}
-            />
-          );
-        })()}
-        {reviewOpen && (
-          <ReviewScreen
-            items={items} rating={rating} setRating={setRating} photos={photos} setPhotos={setPhotos}
-            onClose={() => setReviewOpen(false)}
-            onSubmit={() => { setReviewOpen(false); showToast('후기가 등록됐어요!'); }}
-            getPlaceName={(i) => getPlaceName(i, region)}
-          />
-        )}
-
-        {/* Toast */}
-        {toast && (
-          <div style={{ position: 'absolute', bottom: 88, left: '50%', transform: 'translateX(-50%)', background: 'rgba(22,23,15,0.85)', color: 'white', padding: '10px 20px', borderRadius: 20, fontSize: 13, whiteSpace: 'nowrap', animation: 'omUp 0.2s ease', zIndex: 100 }}>
-            {toast}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// HomeScreen
-// ═══════════════════════════════════════════════════════════════════════════════
-interface HomeProps {
-  items: TimelineItem[];
-  region: string;
-  confirmed: boolean;
-  mapPan: { x: number; y: number };
-  onMapPointerDown: (e: React.PointerEvent) => void;
-  onMapPointerMove: (e: React.PointerEvent) => void;
-  onMapPointerUp: () => void;
-  onReview: () => void;
-  onPlan: () => void;
-  dateIdx: number;
-}
-
-function HomeScreen({ items, region, confirmed, mapPan, onMapPointerDown, onMapPointerMove, onMapPointerUp, onReview, onPlan, dateIdx }: HomeProps) {
-  const pins: [number, number][] = [[80, 380], [160, 300], [240, 240], [320, 200], [400, 280]];
-  const walkMids: [number, number][] = [[120, 340], [200, 270], [280, 220], [360, 240], [420, 240]];
-  const allItems: TimelineItem[] = [
-    ...items,
-    { id: -1, kind: '식사' as const, category: '한식', start: 0, end: 0, placeIdx: 0 },
-    { id: -2, kind: '카페' as const, category: '디저트', start: 0, end: 0, placeIdx: 0 },
-  ].slice(0, 5);
+  // ─────────────────────────────────────────────────────────────────
+  // RENDER
+  // ─────────────────────────────────────────────────────────────────
 
   return (
-    <div style={{ position: 'relative' }}>
-      {/* Map */}
-      <div
-        style={{ height: 480, background: '#E7E9EE', overflow: 'hidden', position: 'relative', cursor: 'grab', touchAction: 'none' }}
-        onPointerDown={onMapPointerDown} onPointerMove={onMapPointerMove} onPointerUp={onMapPointerUp}
-      >
-        {/* Map grid texture */}
-        <div style={{ position: 'absolute', inset: 0, backgroundImage: 'linear-gradient(rgba(0,0,0,0.04) 1px, transparent 1px), linear-gradient(90deg, rgba(0,0,0,0.04) 1px, transparent 1px)', backgroundSize: '40px 40px' }} />
+    <div style={{ minHeight: '100vh', width: '100%', background: '#EDE7EC', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32, fontFamily: "Pretendard,-apple-system,sans-serif" }}>
+      {/* Outer phone shell — #0E0E0C with 54px radius, 11px padding */}
+      <div style={{ position: 'relative', width: 390, height: 844, background: '#0E0E0C', borderRadius: 54, padding: 11, boxShadow: '0 50px 110px -30px rgba(60,20,40,.5), 0 0 0 2px rgba(0,0,0,.2)' }}>
+        {/* Inner screen — gradient, 44px radius */}
+        <div style={{ position: 'relative', width: '100%', height: '100%', background: 'linear-gradient(180deg,#FFE0EB 0%,#FCE7EC 26%,#F1EDF5 58%,#DCEBFF 100%)', borderRadius: 44, overflow: 'hidden' }}>
 
-        <div style={{ position: 'absolute', left: '50%', top: '50%', transform: `translate(calc(-50% + ${mapPan.x}px), calc(-50% + ${mapPan.y}px))`, width: 520, height: 480 }}>
-          {/* Route SVG */}
-          <svg style={{ position: 'absolute', inset: 0, width: 520, height: 480, pointerEvents: 'none' }}>
-            <defs>
-              <style>{`@keyframes omDash { to { stroke-dashoffset: -16; } }`}</style>
-            </defs>
-            <polyline
-              points="80,380 160,300 240,240 320,200 400,280 440,200"
-              stroke="#FF5C97" strokeWidth={3} fill="none" strokeDasharray="8 8"
-              style={{ animation: 'omDash 0.6s linear infinite' }}
-            />
-          </svg>
-
-          {/* Walk time pills */}
-          {WALKS.map((w, i) => (
-            <div key={i} style={{ position: 'absolute', left: walkMids[i][0], top: walkMids[i][1], transform: 'translate(-50%,-50%)', background: '#FF5C97', color: 'white', fontSize: 10, borderRadius: 10, padding: '2px 6px', whiteSpace: 'nowrap', pointerEvents: 'none' }}>
-              도보 {w}분
+          {/* status bar */}
+          <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 54, display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', padding: '0 30px 7px', zIndex: 60, pointerEvents: 'none' }}>
+            <div style={{ fontSize: 15, fontWeight: 800, color: '#16170F', letterSpacing: '-.3px' }}>9:41</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: 2, height: 11 }}>
+                {[5, 7, 9, 11].map((h, i) => <span key={i} style={{ width: 3, height: h, background: '#16170F', borderRadius: 1, display: 'block' }} />)}
+              </div>
+              <div style={{ width: 15, height: 11, border: '1.6px solid #16170F', borderRadius: 3, position: 'relative' }}>
+                <span style={{ position: 'absolute', inset: 1.5, width: 7, background: '#16170F', borderRadius: 1 }} />
+              </div>
             </div>
-          ))}
+          </div>
+          {/* notch */}
+          <div style={{ position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', width: 120, height: 34, background: '#0E0E0C', borderRadius: 20, zIndex: 70 }} />
 
-          {/* Place pins */}
-          {allItems.map((item, i) => {
-            if (i >= pins.length) return null;
-            const [px, py] = pins[i];
-            return (
-              <div key={item.id} style={{ position: 'absolute', left: px, top: py, transform: 'translate(-50%,-50%)', zIndex: 2 }}>
-                {i === 0 && (
-                  <div style={{ position: 'absolute', bottom: 32, left: '50%', transform: 'translateX(-50%)', background: 'white', borderRadius: 12, padding: '8px 12px', boxShadow: '0 4px 12px rgba(0,0,0,0.15)', zIndex: 3, whiteSpace: 'nowrap' }}>
-                    <div style={{ fontSize: 13, fontWeight: 600 }}>{NAMES[item.category || '']?.[0] || '장소'}</div>
-                    <span style={{ fontSize: 10, background: KIND[item.kind].tint, color: KIND[item.kind].numText, padding: '2px 6px', borderRadius: 6 }}>{item.kind}</span>
-                  </div>
-                )}
-                <div style={{ width: 24, height: 24, background: KIND[item.kind].bar, color: 'white', fontSize: 14, fontWeight: 700, borderRadius: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.2)' }}>
-                  {i + 1}
+          {/* ══ HOME ══════════════════════════════════════════════ */}
+          {tab === 'home' && (
+            <div style={{ position: 'absolute', inset: 0 }}>
+              {/* pannable map */}
+              <div onPointerDown={handleMapDown} style={{ position: 'absolute', inset: 0, overflow: 'hidden', background: '#E7E9EE', cursor: 'grab', touchAction: 'none' }}>
+                <div style={{ position: 'absolute', inset: 0, transform: `translate(${mapPan.x}px,${mapPan.y}px)`, willChange: 'transform' }}>
+                  {/* roads */}
+                  <div style={{ position: 'absolute', left: '-10%', top: '50%', width: '120%', height: 30, background: '#FAFBFC', transform: 'rotate(-26deg)' }} />
+                  <div style={{ position: 'absolute', left: '-10%', top: '72%', width: '120%', height: 20, background: '#FAFBFC', transform: 'rotate(-26deg)' }} />
+                  <div style={{ position: 'absolute', left: '18%', top: '-12%', width: 26, height: '130%', background: '#FAFBFC', transform: 'rotate(18deg)' }} />
+                  <div style={{ position: 'absolute', left: '58%', top: '-14%', width: 34, height: '140%', background: '#FAFBFC', transform: 'rotate(14deg)' }} />
+                  <div style={{ position: 'absolute', left: '80%', top: '-10%', width: 18, height: '130%', background: '#FAFBFC', transform: 'rotate(16deg)' }} />
+                  {/* buildings */}
+                  <div style={{ position: 'absolute', left: '5%', top: '14%', width: 120, height: 96, background: '#DDE0E6', borderRadius: 6, transform: 'rotate(-26deg)' }} />
+                  <div style={{ position: 'absolute', left: '64%', top: '20%', width: 150, height: 120, background: '#DDE0E6', borderRadius: 6, transform: 'rotate(14deg)' }} />
+                  <div style={{ position: 'absolute', left: '30%', top: '60%', width: 120, height: 90, background: '#DDE0E6', borderRadius: 6, transform: 'rotate(-26deg)' }} />
+                  <div style={{ position: 'absolute', left: '8%', top: '62%', width: 88, height: 70, background: '#D6E6CE', borderRadius: 10, transform: 'rotate(-26deg)' }} />
+                  <div style={{ position: 'absolute', right: '-6%', top: '6%', width: 120, height: 120, background: '#CFE0EC', borderRadius: 14, transform: 'rotate(14deg)' }} />
+                  {/* route SVG */}
+                  <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', overflow: 'visible' }}>
+                    <polyline
+                      points={sorted.slice(0, 4).map((_, i) => POS[i].join(',')).join(' ')}
+                      fill="none" stroke="#FF5C97" strokeWidth="2.4" strokeDasharray="0.5 4"
+                      strokeLinecap="round" vectorEffect="non-scaling-stroke"
+                      style={{ animation: 'omDash 1.2s linear infinite' }}
+                    />
+                  </svg>
+                  {/* walk-time pills */}
+                  {sorted.slice(0, 4).map((_, idx) => idx > 0 && (
+                    <div key={idx} style={{ position: 'absolute', left: `${(POS[idx-1][0]+POS[idx][0])/2}%`, top: `${(POS[idx-1][1]+POS[idx][1])/2}%`, transform: 'translate(-50%,-50%)', zIndex: 4 }}>
+                      <div style={{ background: '#FF5C97', color: '#fff', fontSize: 10, fontWeight: 800, padding: '3px 8px', borderRadius: 9, whiteSpace: 'nowrap', boxShadow: '0 4px 10px -3px rgba(240,86,140,.5)' }}>
+                        도보 {walkMins[(idx-1) % walkMins.length]}분
+                      </div>
+                    </div>
+                  ))}
+                  {/* pins */}
+                  {sorted.slice(0, 4).map((it, idx) => (
+                    <div key={it.id} style={{ position: 'absolute', left: `${POS[idx][0]}%`, top: `${POS[idx][1]}%`, transform: 'translate(-50%,-50%)', zIndex: 5 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <div style={{ position: 'relative', width: 38, height: 38, flexShrink: 0 }}>
+                          <span style={{ position: 'absolute', inset: 0, borderRadius: '50%', background: '#FF5C97' }} />
+                          <span style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '5px solid #FFC2D8' }} />
+                          <span style={{ position: 'absolute', inset: 0, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 800, fontSize: 15 }}>{idx+1}</span>
+                        </div>
+                        <div style={{ background: '#fff', borderRadius: 11, padding: '6px 10px', boxShadow: '0 8px 16px -8px rgba(0,0,0,.3)', whiteSpace: 'nowrap' }}>
+                          <div style={{ fontSize: 12, fontWeight: 800, color: '#16170F', lineHeight: 1.15 }}>{fmt(it.start)}</div>
+                          <div style={{ fontSize: 11, color: '#9A96A0', fontWeight: 700 }}>{placeName(it)}</div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
-            );
-          })}
-        </div>
 
-        {/* Top info card */}
-        <div style={{ position: 'absolute', top: 16, left: 16, right: 16, background: 'rgba(255,255,255,0.92)', backdropFilter: 'blur(16px)', borderRadius: 20, padding: '12px 16px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <span style={{ fontSize: 16, fontWeight: 700, color: '#16170F' }}>{region} · {DATES[dateIdx]}</span>
-            <button style={{ width: 36, height: 36, background: '#FF5C97', borderRadius: 18, color: 'white', border: 'none', cursor: 'pointer', fontSize: 18, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>📍</button>
-          </div>
-          {confirmed && (
-            <div style={{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 4, background: '#E6F9F0', color: '#1A9A60', fontSize: 12, fontWeight: 600, padding: '4px 10px', borderRadius: 12 }}>
-              ✓ 예약 확정
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Course summary card */}
-      <div style={{ position: 'relative', margin: '0 16px', marginTop: -24, background: 'white', borderRadius: 20, padding: 16, boxShadow: '0 4px 20px rgba(0,0,0,0.10)', zIndex: 5 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-          <span style={{ fontSize: 15, fontWeight: 700 }}>오늘의 코스</span>
-          {confirmed && (
-            <button onClick={onReview} style={{ background: '#FF5C97', color: 'white', border: 'none', borderRadius: 16, padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>후기 쓰기</button>
-          )}
-        </div>
-
-        {items.length === 0 ? (
-          <div style={{ textAlign: 'center', color: '#9A96A0', fontSize: 13, padding: '16px 0' }}>
-            아직 코스가 없어요.<br />
-            <button onClick={onPlan} style={{ marginTop: 8, background: '#FF5C97', color: 'white', border: 'none', borderRadius: 12, padding: '8px 16px', fontSize: 13, cursor: 'pointer' }}>코스 짜기</button>
-          </div>
-        ) : (
-          <div style={{ maxHeight: 128, overflowY: 'auto' }}>
-            {items.map((item, idx) => (
-              <div key={item.id}>
-                {idx > 0 && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0 4px 8px' }}>
-                    <span style={{ fontSize: 10, color: '#9A96A0' }}>↓ 도보 {WALKS[idx - 1]}분</span>
+              {/* top date card */}
+              <div style={{ position: 'absolute', top: 60, left: 16, right: 16, display: 'flex', alignItems: 'center', gap: 10, zIndex: 20 }}>
+                <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 11, background: '#fff', borderRadius: 18, padding: '12px 14px', boxShadow: '0 12px 30px -14px rgba(0,0,0,.28)' }}>
+                  <span style={{ width: 24, height: 24, borderRadius: '50%', background: 'linear-gradient(135deg,#FF8FB8,#FF5C97)', flexShrink: 0, boxShadow: '0 0 0 4px #FFE2EC', display: 'block' }} />
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 15, fontWeight: 800, color: '#16170F', lineHeight: 1.1 }}>{region} 데이트</div>
+                    <div style={{ fontSize: 12, color: '#9A96A0', fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{date}</div>
                   </div>
-                )}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' }}>
-                  <div style={{ width: 24, height: 24, background: KIND[item.kind].num, color: KIND[item.kind].numText, borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, fontWeight: 700, flexShrink: 0 }}>
-                    {idx + 1}
-                  </div>
-                  <span style={{ fontSize: 12, color: KIND[item.kind].numText, fontWeight: 600 }}>{item.kind}</span>
-                  <span style={{ fontSize: 12, color: '#555', flex: 1 }}>{NAMES[item.category || '']?.[item.placeIdx % 3] || '장소'}</span>
-                  <span style={{ fontSize: 11, color: '#9A96A0' }}>{fmtTime(item.start)}</span>
                 </div>
+                <button onClick={() => setShowSearch(true)} style={{ width: 48, height: 48, borderRadius: 16, background: '#FF5C97', border: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0, boxShadow: '0 12px 24px -10px rgba(240,86,140,.6)' }}>
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
+                </button>
               </div>
-            ))}
-          </div>
-        )}
 
-        <button onClick={onPlan} style={{ width: '100%', marginTop: 12, background: 'linear-gradient(135deg, #FF5C97, #FF8FB8)', color: 'white', border: 'none', borderRadius: 14, height: 44, fontSize: 15, fontWeight: 700, cursor: 'pointer' }}>
-          {confirmed ? '코스 수정하기' : '코스 짜기 →'}
-        </button>
-      </div>
-
-      {/* Bottom padding */}
-      <div style={{ height: 24 }} />
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PlanBuildScreen
-// ═══════════════════════════════════════════════════════════════════════════════
-interface PlanBuildProps {
-  items: TimelineItem[];
-  region: string;
-  dateIdx: number;
-  onSetDateIdx: (i: number) => void;
-  onDelete: (id: number) => void;
-  onAdd: (kind: '식사' | '카페' | '놀거리') => void;
-  onCatPick: (id: number) => void;
-  onNext: () => void;
-  dragRef: React.MutableRefObject<{ type: 'move' | 'resize'; id: number; startY: number; origStart: number; origEnd: number; moved: number } | null>;
-  onTimelinePointerMove: (e: React.PointerEvent) => void;
-  onTimelinePointerUp: () => void;
-  onRegionClick: () => void;
-}
-
-function PlanBuildScreen({ items, region, dateIdx, onSetDateIdx, onDelete, onAdd, onCatPick, onNext, dragRef, onTimelinePointerMove, onTimelinePointerUp, onRegionClick }: PlanBuildProps) {
-  const hours = Array.from({ length: HOURS }, (_, i) => i + 9);
-
-  return (
-    <div style={{ background: 'white', minHeight: '100%' }}>
-      {/* Header */}
-      <div style={{ padding: '16px 16px 0' }}>
-        <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 10 }}>코스 짜기</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <button onClick={() => onSetDateIdx(Math.max(0, dateIdx - 1))} style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', color: '#9A96A0' }}>‹</button>
-          <span style={{ fontWeight: 600, fontSize: 14 }}>{DATES[dateIdx]}</span>
-          <button onClick={() => onSetDateIdx(Math.min(DATES.length - 1, dateIdx + 1))} style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', color: '#9A96A0' }}>›</button>
-          <button onClick={onRegionClick} style={{ marginLeft: 8, background: '#FFE2EC', color: '#FF5C97', border: 'none', borderRadius: 12, padding: '4px 12px', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
-            📍 {region}
-          </button>
-        </div>
-      </div>
-
-      {/* Timeline */}
-      <div
-        style={{ position: 'relative', height: HOURS * HOURH, marginTop: 12, paddingLeft: 48, touchAction: 'none' }}
-        onPointerMove={onTimelinePointerMove}
-        onPointerUp={onTimelinePointerUp}
-      >
-        {/* Hour grid */}
-        {hours.map((h, i) => (
-          <React.Fragment key={h}>
-            <div style={{ position: 'absolute', left: 0, width: 40, top: i * HOURH + 2, textAlign: 'right', fontSize: 11, color: '#9A96A0', lineHeight: 1 }}>
-              {h > 12 ? h - 12 : h}{h === 12 || h === 24 ? '' : ''}
-            </div>
-            <div style={{ position: 'absolute', left: 48, right: 0, top: i * HOURH, height: 1, background: 'rgba(0,0,0,0.06)' }} />
-          </React.Fragment>
-        ))}
-
-        {/* Empty state */}
-        {items.length === 0 && (
-          <div style={{ position: 'absolute', left: '50%', top: '40%', transform: 'translate(-50%,-50%)', textAlign: 'center', color: '#9A96A0', fontSize: 13, border: '2px dashed #E0E0E0', borderRadius: 16, padding: '24px 32px' }}>
-            아래 버튼으로 항목을 추가해보세요
-          </div>
-        )}
-
-        {/* Timeline blocks */}
-        {items.map((item) => {
-          const top = (item.start - START) / 60 * HOURH;
-          const height = Math.max(32, (item.end - item.start) / 60 * HOURH - 4);
-          return (
-            <div
-              key={item.id}
-              style={{ position: 'absolute', top, left: 48 + 8, right: 8, height, background: KIND[item.kind].tint, borderRadius: 12, overflow: 'hidden', cursor: 'grab', touchAction: 'none' }}
-              onPointerDown={(e) => {
-                (e.currentTarget.closest('[data-timeline]') as HTMLElement | null)?.setPointerCapture?.(e.pointerId);
-                (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-                dragRef.current = { type: 'move', id: item.id, startY: e.clientY, origStart: item.start, origEnd: item.end, moved: 0 };
-              }}
-              onClick={() => {
-                if (!dragRef.current || dragRef.current.moved < 5) onCatPick(item.id);
-              }}
-            >
-              {/* Color bar */}
-              <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 4, background: KIND[item.kind].bar }} />
-              {/* Content */}
-              <div style={{ padding: '4px 8px 4px 12px', height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                    <span style={{ fontSize: 10, background: KIND[item.kind].num, color: KIND[item.kind].numText, padding: '1px 6px', borderRadius: 6, fontWeight: 600 }}>{item.category}</span>
-                    <span style={{ fontSize: 10, color: '#9A96A0' }}>{fmtTime(item.start)}–{fmtTime(item.end)}</span>
+              {confirmed && (
+                <div style={{ position: 'absolute', top: 122, left: 16, right: 16, zIndex: 21, display: 'flex', justifyContent: 'center' }}>
+                  <div style={{ background: '#16170F', color: '#fff', fontWeight: 800, fontSize: 12.5, padding: '9px 16px', borderRadius: 13, boxShadow: '0 12px 24px -10px rgba(0,0,0,.4)', display: 'flex', alignItems: 'center', gap: 7 }}>
+                    <span style={{ color: '#FF8FB8' }}>✓</span> 오늘의 코스가 확정됐어요
                   </div>
-                  <button
-                    onPointerDown={(e) => e.stopPropagation()}
-                    onClick={(e) => { e.stopPropagation(); deleteItem(item.id); }}
-                    style={{ background: 'none', border: 'none', color: '#9A96A0', cursor: 'pointer', fontSize: 14, padding: '0 4px' }}
-                  >×</button>
                 </div>
-                <div style={{ fontSize: 13, fontWeight: 600, color: '#16170F', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {NAMES[item.category || '']?.[item.placeIdx % 3] || '장소'}
-                </div>
-              </div>
-              {/* Resize handle */}
-              <div
-                style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: 12, cursor: 'ns-resize', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-                  dragRef.current = { type: 'resize', id: item.id, startY: e.clientY, origStart: item.start, origEnd: item.end, moved: 0 };
-                }}
-              >
-                <div style={{ width: 32, height: 3, background: 'rgba(0,0,0,0.15)', borderRadius: 2 }} />
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Bottom toolbar */}
-      <div style={{ position: 'sticky', bottom: 0, background: 'white', padding: '8px 16px 12px', borderTop: '1px solid rgba(0,0,0,0.06)', boxShadow: '0 -4px 12px rgba(0,0,0,0.04)' }}>
-        <div style={{ fontSize: 11, color: '#B5B0BC', textAlign: 'center', marginBottom: 8 }}>항목을 드래그해 시간대를 조정하세요</div>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
-          {(['식사', '카페', '놀거리'] as const).map(kind => (
-            <button key={kind} onClick={() => onAdd(kind)} style={{ flex: 1, background: KIND[kind].tint, color: KIND[kind].numText, border: 'none', borderRadius: 20, padding: '8px 0', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
-              + {kind}
-            </button>
-          ))}
-        </div>
-        <button onClick={onNext} style={{ width: '100%', background: '#FF5C97', color: 'white', border: 'none', borderRadius: 16, height: 48, fontSize: 15, fontWeight: 700, cursor: 'pointer' }}>
-          계획 짜기 →
-        </button>
-      </div>
-    </div>
-  );
-
-  function deleteItem(id: number) { onDelete(id); }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PlanFinalScreen
-// ═══════════════════════════════════════════════════════════════════════════════
-interface PlanFinalProps {
-  items: TimelineItem[];
-  region: string;
-  dateIdx: number;
-  totalOriginal: number;
-  totalDiscount: number;
-  totalFinal: number;
-  discountPct: number;
-  onBack: () => void;
-  onPlacePick: (id: number) => void;
-  onConfirm: () => void;
-  getPlaceName: (i: TimelineItem) => string;
-  getAddress: (i: TimelineItem) => string;
-}
-
-function PlanFinalScreen({ items, region, dateIdx, totalOriginal, totalDiscount, totalFinal, discountPct, onBack, onPlacePick, onConfirm, getPlaceName, getAddress }: PlanFinalProps) {
-  const tiers = [
-    { n: '1곳', pct: 5 },
-    { n: '2곳', pct: 10 },
-    { n: '3곳', pct: 15 },
-    { n: '4곳', pct: 20 },
-  ];
-
-  return (
-    <div style={{ background: '#F8F8F8', minHeight: '100%', paddingBottom: 120 }}>
-      {/* Header */}
-      <div style={{ background: 'white', padding: '16px 16px 12px', display: 'flex', alignItems: 'center', gap: 12 }}>
-        <button onClick={onBack} style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer', color: '#333' }}>←</button>
-        <div>
-          <div style={{ fontSize: 18, fontWeight: 700 }}>추천 코스</div>
-          <div style={{ fontSize: 12, color: '#9A96A0' }}>{region} · {DATES[dateIdx]}</div>
-        </div>
-      </div>
-
-      {/* Discount tier bar */}
-      <div style={{ margin: '12px 16px', background: 'white', borderRadius: 16, padding: '12px 16px', display: 'flex', gap: 4 }}>
-        {tiers.map((t, i) => (
-          <div key={i} style={{ flex: 1, textAlign: 'center', padding: '6px 0', borderRadius: 10, background: items.length >= i + 1 ? '#FF5C97' : '#F5F5F5', color: items.length >= i + 1 ? 'white' : '#9A96A0', fontSize: 11, fontWeight: 600, transition: 'all 0.2s' }}>
-            <div>{t.n}</div>
-            <div style={{ fontSize: 13, fontWeight: 700 }}>{t.pct}%</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Course cards */}
-      <div style={{ padding: '0 16px' }}>
-        {items.map((item, idx) => (
-          <div key={item.id}>
-            {idx > 0 && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 12px' }}>
-                <div style={{ width: 1, height: 16, background: '#E0E0E0' }} />
-                <span style={{ fontSize: 11, color: '#9A96A0', background: 'rgba(0,0,0,0.06)', padding: '2px 8px', borderRadius: 8 }}>도보 {WALKS[idx - 1]}분</span>
-              </div>
-            )}
-            <div style={{ background: 'white', borderRadius: 20, padding: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                <div style={{ width: 24, height: 24, background: KIND[item.kind].bar, color: 'white', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, fontWeight: 700 }}>{idx + 1}</div>
-                <span style={{ fontSize: 11, color: '#9A96A0' }}>{fmtTime(item.start)}–{fmtTime(item.end)}</span>
-                <span style={{ fontSize: 11, background: KIND[item.kind].tint, color: KIND[item.kind].numText, padding: '2px 8px', borderRadius: 8, fontWeight: 600 }}>{item.kind}</span>
-                {item.isPartner ? (
-                  <span style={{ fontSize: 10, background: 'linear-gradient(135deg, #FF5C97, #FF8FB8)', color: 'white', padding: '2px 8px', borderRadius: 8, fontWeight: 600 }}>파트너</span>
-                ) : (
-                  <span style={{ fontSize: 10, background: '#F0F0F0', color: '#9A96A0', padding: '2px 8px', borderRadius: 8 }}>일반</span>
-                )}
-              </div>
-              <div style={{ fontSize: 17, fontWeight: 800, marginBottom: 4 }}>{getPlaceName(item)}</div>
-              <div style={{ fontSize: 12, color: '#9A96A0', marginBottom: 12 }}>{getAddress(item)}</div>
-              {item.placeRating && <div style={{ fontSize: 12, color: '#F4A65C', marginBottom: 8 }}>{'★'.repeat(Math.round(item.placeRating))} {item.placeRating.toFixed(1)}</div>}
-              <button onClick={() => onPlacePick(item.id)} style={{ background: '#F5F5F5', color: '#555', border: 'none', borderRadius: 10, padding: '8px 14px', fontSize: 12, cursor: 'pointer' }}>
-                다른 곳 선택 ›
-              </button>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* Bottom bar */}
-      <div style={{ position: 'fixed', bottom: 72, left: '50%', transform: 'translateX(-50%)', width: 388, background: 'white', padding: '12px 16px', borderTop: '1px solid rgba(0,0,0,0.06)', boxShadow: '0 -4px 12px rgba(0,0,0,0.08)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-          <div>
-            <span style={{ fontSize: 12, color: '#9A96A0', textDecoration: 'line-through' }}>₩{totalOriginal.toLocaleString()}</span>
-            <span style={{ fontSize: 12, color: '#FF5C97', fontWeight: 600, marginLeft: 8 }}>-{discountPct}% 할인</span>
-          </div>
-          <span style={{ fontSize: 16, fontWeight: 700 }}>₩{totalFinal.toLocaleString()}</span>
-        </div>
-        <button onClick={onConfirm} style={{ width: '100%', background: 'linear-gradient(135deg, #FF5C97, #FF8FB8)', color: 'white', border: 'none', borderRadius: 16, height: 48, fontSize: 15, fontWeight: 700, cursor: 'pointer' }}>
-          계획 확정 →
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CheckoutScreen
-// ═══════════════════════════════════════════════════════════════════════════════
-interface CheckoutProps {
-  items: TimelineItem[];
-  payIdx: number;
-  setPayIdx: (i: number) => void;
-  totalOriginal: number;
-  totalDiscount: number;
-  totalFinal: number;
-  discountPct: number;
-  onBack: () => void;
-  onPay: () => void;
-  getPlaceName: (i: TimelineItem) => string;
-}
-
-function CheckoutScreen({ items, payIdx, setPayIdx, totalOriginal, totalDiscount, totalFinal, discountPct, onBack, onPay, getPlaceName }: CheckoutProps) {
-  const payMethods = ['카카오페이', '네이버페이', '신용·체크카드'];
-
-  return (
-    <div style={{ background: '#F8F8F8', minHeight: '100%', paddingBottom: 100 }}>
-      <div style={{ background: 'white', padding: '16px 16px 12px', display: 'flex', alignItems: 'center', gap: 12 }}>
-        <button onClick={onBack} style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer' }}>←</button>
-        <span style={{ fontSize: 18, fontWeight: 700 }}>결제·예약</span>
-      </div>
-
-      <div style={{ margin: '12px 16px', background: '#FBF7F9', borderRadius: 16, padding: 12 }}>
-        {items.map((item, idx) => (
-          <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0' }}>
-            <div style={{ width: 20, height: 20, background: KIND[item.kind].bar, color: 'white', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 700, flexShrink: 0 }}>{idx + 1}</div>
-            <span style={{ fontSize: 13, fontWeight: 600, flex: 1 }}>{getPlaceName(item)}</span>
-            <span style={{ fontSize: 11, color: '#9A96A0' }}>{fmtTime(item.start)}</span>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ margin: '0 16px 12px', background: 'white', borderRadius: 20, padding: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-          <span style={{ fontSize: 14, color: '#666' }}>정가</span>
-          <span style={{ fontSize: 14 }}>₩{totalOriginal.toLocaleString()}</span>
-        </div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
-          <span style={{ fontSize: 14, color: '#FF5C97', fontWeight: 600 }}>코스 할인 ({discountPct}%)</span>
-          <span style={{ fontSize: 14, color: '#FF5C97', fontWeight: 600 }}>-₩{totalDiscount.toLocaleString()}</span>
-        </div>
-        <div style={{ height: 1, background: '#F0F0F0', marginBottom: 12 }} />
-        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-          <span style={{ fontSize: 16, fontWeight: 700 }}>최종 결제</span>
-          <span style={{ fontSize: 18, fontWeight: 800, color: '#FF5C97' }}>₩{totalFinal.toLocaleString()}</span>
-        </div>
-      </div>
-
-      <div style={{ margin: '0 16px 12px' }}>
-        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: '#333' }}>결제 수단</div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          {payMethods.map((m, i) => (
-            <button key={i} onClick={() => setPayIdx(i)} style={{ flex: 1, padding: '10px 0', borderRadius: 12, border: 'none', background: payIdx === i ? '#FF5C97' : '#F5F5F5', color: payIdx === i ? 'white' : '#555', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
-              {m}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div style={{ position: 'fixed', bottom: 72, left: '50%', transform: 'translateX(-50%)', width: 388, padding: '12px 16px', background: 'white', borderTop: '1px solid rgba(0,0,0,0.06)' }}>
-        <button onClick={onPay} style={{ width: '100%', background: 'linear-gradient(135deg, #FF5C97, #FF8FB8)', color: 'white', border: 'none', borderRadius: 16, height: 52, fontSize: 16, fontWeight: 700, cursor: 'pointer' }}>
-          ₩{totalFinal.toLocaleString()} 결제하고 예약
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CompleteScreen
-// ═══════════════════════════════════════════════════════════════════════════════
-function CompleteScreen({ items, onHome, onReview, getPlaceName }: { items: TimelineItem[]; onHome: () => void; onReview: () => void; getPlaceName: (i: TimelineItem) => string }) {
-  return (
-    <div style={{ minHeight: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '32px 16px', background: 'white' }}>
-      {/* Animated check */}
-      <div style={{ position: 'relative', width: 96, height: 96, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <div style={{ position: 'absolute', inset: 0, borderRadius: 48, background: 'rgba(255,92,151,0.15)', animation: 'omRing 1.5s ease-out infinite' }} />
-        <div style={{ width: 64, height: 64, background: '#FF5C97', borderRadius: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 8px 24px rgba(255,92,151,0.4)' }}>
-          <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
-            <path d="M6 14l6 6 10-12" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </div>
-      </div>
-
-      <div style={{ fontSize: 22, fontWeight: 800, marginTop: 24, textAlign: 'center' }}>예약이 확정됐어요!</div>
-      <div style={{ fontSize: 14, color: '#9A96A0', marginTop: 8 }}>결제가 완료되었어요</div>
-
-      <div style={{ width: '100%', background: '#FBF7F9', borderRadius: 16, padding: 12, marginTop: 24 }}>
-        {items.map((item, idx) => (
-          <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0' }}>
-            <div style={{ width: 22, height: 22, background: KIND[item.kind].bar, color: 'white', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, flexShrink: 0 }}>{idx + 1}</div>
-            <span style={{ fontSize: 14, fontWeight: 600 }}>{getPlaceName(item)}</span>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ display: 'flex', gap: 12, marginTop: 24, width: '100%' }}>
-        <button onClick={onReview} style={{ flex: 1, height: 48, background: 'white', border: '2px solid #FF5C97', color: '#FF5C97', borderRadius: 16, fontSize: 15, fontWeight: 700, cursor: 'pointer' }}>후기 쓰기</button>
-        <button onClick={onHome} style={{ flex: 1, height: 48, background: '#FF5C97', color: 'white', border: 'none', borderRadius: 16, fontSize: 15, fontWeight: 700, cursor: 'pointer' }}>홈으로</button>
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CalendarScreen
-// ═══════════════════════════════════════════════════════════════════════════════
-function CalendarScreen({ dateIdx, setDateIdx, region }: { dateIdx: number; setDateIdx: (i: number) => void; region: string }) {
-  const dayHeaders = ['일', '월', '화', '수', '목', '금', '토'];
-  // June 2026 starts on Monday (index 1)
-  const startOffset = 1;
-  const daysInMonth = 30;
-  const highlightDays = [18, 19, 20];
-
-  const cells: (number | null)[] = [
-    ...Array(startOffset).fill(null),
-    ...Array.from({ length: daysInMonth }, (_, i) => i + 1),
-  ];
-
-  return (
-    <div>
-      <div style={{ fontSize: 20, fontWeight: 800, padding: '20px 20px 16px' }}>캘린더</div>
-
-      <div style={{ margin: '0 16px', background: 'white', borderRadius: 20, padding: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-          <button style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', color: '#9A96A0' }}>‹</button>
-          <span style={{ fontWeight: 700, fontSize: 15 }}>2026년 6월</span>
-          <button style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', color: '#9A96A0' }}>›</button>
-        </div>
-
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: '4px 0', textAlign: 'center' }}>
-          {dayHeaders.map(d => (
-            <div key={d} style={{ fontSize: 11, color: '#9A96A0', fontWeight: 600, padding: '4px 0' }}>{d}</div>
-          ))}
-          {cells.map((day, i) => (
-            <div key={i} style={{ padding: '4px 0', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-              {day !== null && (
-                <>
-                  <div style={{ width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 16, background: highlightDays.includes(day) ? '#FF5C97' : 'transparent', color: highlightDays.includes(day) ? 'white' : '#333', fontSize: 13, fontWeight: highlightDays.includes(day) ? 700 : 400, cursor: highlightDays.includes(day) ? 'pointer' : 'default' }}>
-                    {day}
-                  </div>
-                  {highlightDays.includes(day) && <div style={{ width: 4, height: 4, borderRadius: 2, background: '#FF5C97', marginTop: 2 }} />}
-                </>
               )}
-            </div>
-          ))}
-        </div>
-      </div>
 
-      <div style={{ margin: '12px 16px', background: 'white', borderRadius: 20, padding: 16, boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
-        <div style={{ fontSize: 12, color: '#9A96A0', marginBottom: 8 }}>다가오는 데이트</div>
-        <div style={{ fontSize: 15, fontWeight: 700 }}>{DATES[0]}</div>
-        <div style={{ fontSize: 13, color: '#9A96A0', marginTop: 4 }}>📍 {region}</div>
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MyPageScreen
-// ═══════════════════════════════════════════════════════════════════════════════
-function MyPageScreen() {
-  const menuItems = ['내 코스 보기', '커플 설정', '알림 설정', '앱 평가하기'];
-
-  return (
-    <div style={{ paddingBottom: 16 }}>
-      {/* Profile card */}
-      <div style={{ margin: '16px 16px 0', background: 'linear-gradient(135deg, #FF5C97, #FF8FB8)', borderRadius: 24, padding: 20, color: 'white' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-          <div style={{ position: 'relative', width: 80, height: 48 }}>
-            <div style={{ position: 'absolute', left: 0, width: 48, height: 48, borderRadius: 24, background: 'rgba(255,255,255,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22 }}>👨</div>
-            <div style={{ position: 'absolute', left: 28, width: 48, height: 48, borderRadius: 24, background: 'rgba(255,255,255,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22 }}>👩</div>
-          </div>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 20, fontWeight: 800 }}>{COUPLE_NAME}</div>
-            <div style={{ fontSize: 12, opacity: 0.85, marginTop: 4 }}>함께한 지 D+412일</div>
-          </div>
-          <div style={{ background: 'rgba(255,255,255,0.25)', borderRadius: 12, padding: '6px 12px', fontSize: 13, fontWeight: 700 }}>D+412</div>
-        </div>
-      </div>
-
-      {/* Stats */}
-      <div style={{ margin: '12px 16px', display: 'flex', gap: 8 }}>
-        <div style={{ flex: 1, background: 'white', borderRadius: 16, padding: 16, textAlign: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
-          <div style={{ fontSize: 11, color: '#9A96A0', marginBottom: 4 }}>이용 코스</div>
-          <div style={{ fontSize: 22, fontWeight: 800 }}>12회</div>
-        </div>
-        <div style={{ flex: 1, background: 'white', borderRadius: 16, padding: 16, textAlign: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
-          <div style={{ fontSize: 11, color: '#9A96A0', marginBottom: 4 }}>총 절약</div>
-          <div style={{ fontSize: 20, fontWeight: 800 }}>87,600원</div>
-        </div>
-      </div>
-
-      {/* Crew promo */}
-      <div style={{ margin: '0 16px 12px', background: '#1A1A2E', borderRadius: 20, padding: 16, color: 'white' }}>
-        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
-          <div>
-            <div style={{ fontSize: 11, color: '#F4A65C', fontWeight: 600, marginBottom: 4 }}>👑 원모어 크루</div>
-            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>더 많은 혜택을 누려요</div>
-            <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.6)' }}>월 정기 구독으로 최대 30% 할인</div>
-          </div>
-          <button style={{ background: '#FF5C97', color: 'white', border: 'none', borderRadius: 12, padding: '8px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap', marginLeft: 12, flexShrink: 0 }}>가입하기</button>
-        </div>
-      </div>
-
-      {/* Menu list */}
-      <div style={{ margin: '0 16px', background: 'white', borderRadius: 20, overflow: 'hidden', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
-        {menuItems.map((m, i) => (
-          <button key={m} style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px', background: 'none', border: 'none', borderBottom: i < menuItems.length - 1 ? '1px solid #F5F5F5' : 'none', cursor: 'pointer', textAlign: 'left' }}>
-            <span style={{ fontSize: 14, fontWeight: 500 }}>{m}</span>
-            <span style={{ color: '#9A96A0', fontSize: 18 }}>›</span>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PlaceSearchSheet
-// ═══════════════════════════════════════════════════════════════════════════════
-function PlaceSearchSheet({ input, suggestions, onInputChange, onSelect, onClose }: {
-  input: string;
-  suggestions: RegionSuggestion[];
-  onInputChange: (v: string) => void;
-  onSelect: (r: string) => void;
-  onClose: () => void;
-}) {
-  const displayList = suggestions.length > 0 ? suggestions.map(s => s.name) : REGIONS;
-
-  return (
-    <>
-      <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 50 }} onClick={onClose} />
-      <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'white', borderRadius: '24px 24px 0 0', padding: '20px 16px', zIndex: 51 }}>
-        <div style={{ width: 32, height: 4, background: '#E0E0E0', borderRadius: 2, margin: '0 auto 16px' }} />
-        <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 12 }}>어디로 갈까요?</div>
-        <input
-          value={input}
-          onChange={e => onInputChange(e.target.value)}
-          placeholder="지역 검색..."
-          style={{ width: '100%', background: '#F5F5F5', borderRadius: 12, padding: '10px 14px', border: 'none', outline: 'none', fontSize: 14 }}
-          autoFocus
-        />
-        <div style={{ marginTop: 12 }}>
-          {displayList.map((r, i) => (
-            <button key={i} onClick={() => onSelect(typeof r === 'string' ? r : r)} style={{ width: '100%', display: 'block', textAlign: 'left', padding: '12px 4px', background: 'none', border: 'none', borderBottom: '1px solid #F5F5F5', cursor: 'pointer', fontSize: 14 }}>
-              {suggestions.length > 0 ? (
-                <span>
-                  <span style={{ fontWeight: 600 }}>{suggestions[i]?.name}</span>
-                  <span style={{ color: '#9A96A0', marginLeft: 8, fontSize: 12 }}>{suggestions[i]?.sub}</span>
-                </span>
-              ) : r}
-            </button>
-          ))}
-        </div>
-      </div>
-    </>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CategoryPickerSheet
-// ═══════════════════════════════════════════════════════════════════════════════
-function CategoryPickerSheet({ item, onSelect, onClose }: { item: TimelineItem; onSelect: (cat: string) => void; onClose: () => void }) {
-  const cats = CAT[item.kind] || [];
-
-  return (
-    <>
-      <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 50 }} onClick={onClose} />
-      <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: KIND[item.kind].sheet, borderRadius: '24px 24px 0 0', padding: '20px 16px', zIndex: 51 }}>
-        <div style={{ width: 32, height: 4, background: '#E0E0E0', borderRadius: 2, margin: '0 auto 16px' }} />
-        <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 16 }}>카테고리 선택</div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-          {cats.map(cat => (
-            <button key={cat} onClick={() => onSelect(cat)} style={{ padding: '10px 18px', borderRadius: 20, border: 'none', background: item.category === cat ? KIND[item.kind].bar : 'white', color: item.category === cat ? 'white' : '#333', fontSize: 14, fontWeight: item.category === cat ? 700 : 400, cursor: 'pointer', transition: 'all 0.15s' }}>
-              {cat}
-            </button>
-          ))}
-        </div>
-        <div style={{ height: 24 }} />
-      </div>
-    </>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PlaceSwapSheet
-// ═══════════════════════════════════════════════════════════════════════════════
-function PlaceSwapSheet({ item, candidates, loading, onSelect, onClose }: {
-  item: TimelineItem;
-  candidates: PlaceCandidate[];
-  loading: boolean;
-  onSelect: (c: PlaceCandidate) => void;
-  onClose: () => void;
-}) {
-  return (
-    <>
-      <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 50 }} onClick={onClose} />
-      <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'white', borderRadius: '24px 24px 0 0', padding: '20px 16px', maxHeight: '70%', overflowY: 'auto', zIndex: 51 }}>
-        <div style={{ width: 32, height: 4, background: '#E0E0E0', borderRadius: 2, margin: '0 auto 16px' }} />
-        <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 16 }}>다른 곳 선택</div>
-        {loading ? (
-          <div style={{ textAlign: 'center', padding: '32px 0', color: '#9A96A0' }}>검색 중...</div>
-        ) : candidates.length === 0 ? (
-          <div style={{ textAlign: 'center', padding: '32px 0', color: '#9A96A0' }}>장소를 찾지 못했어요</div>
-        ) : (
-          candidates.map((c, i) => (
-            <div key={c.placeId} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 0', borderBottom: i < candidates.length - 1 ? '1px solid #F5F5F5' : 'none' }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                  {c.isPartner && <span style={{ fontSize: 10, background: 'linear-gradient(135deg, #FF5C97, #FF8FB8)', color: 'white', padding: '2px 6px', borderRadius: 6, fontWeight: 600 }}>파트너</span>}
-                  <span style={{ fontSize: 12, color: '#F4A65C' }}>{'★'.repeat(Math.round(c.rating))} {c.rating.toFixed(1)}</span>
+              {/* bottom course card */}
+              <div style={{ position: 'absolute', left: 14, right: 14, bottom: 100, zIndex: 20, background: '#fff', borderRadius: 26, padding: '16px 18px 0', boxShadow: '0 24px 54px -20px rgba(0,0,0,.4)', display: 'flex', flexDirection: 'column' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 11, flexShrink: 0 }}>
+                  <div style={{ fontSize: 16, fontWeight: 800, color: '#16170F' }}>오늘의 코스</div>
+                  <div style={{ background: 'linear-gradient(135deg,#FF8FB8,#F0568C)', color: '#fff', fontWeight: 800, fontSize: 12.5, padding: '6px 12px', borderRadius: 11, boxShadow: '0 6px 14px -6px rgba(240,86,140,.6)' }}>+{won(discountRawN)} 할인</div>
                 </div>
-                <div style={{ fontSize: 15, fontWeight: 700 }}>{c.name}</div>
+                <div style={{ overflowY: 'auto', maxHeight: 128, flexShrink: 0 }}>
+                  {sorted.map((it, idx) => (
+                    <div key={it.id}>
+                      {idx > 0 && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0 2px 13px' }}>
+                          <div style={{ width: 1, height: 12, borderLeft: '1.5px dashed #D8D4DE' }} />
+                          <span style={{ fontSize: 10, color: '#B5B0BC', fontWeight: 700 }}>도보 {walkMins[(idx-1) % walkMins.length]}분</span>
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '2px 0' }}>
+                        <div style={{ width: 26, height: 26, borderRadius: 8, background: KIND[it.kind].num, color: KIND[it.kind].numText, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 12, flexShrink: 0 }}>{idx+1}</div>
+                        <div style={{ fontSize: 12.5, fontWeight: 800, color: '#16170F', width: 40 }}>{fmt(it.start)}</div>
+                        <div style={{ fontSize: 13.5, fontWeight: 700, color: '#16170F', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{placeName(it)}</div>
+                        <div style={{ fontSize: 11, color: '#B5B0BC', fontWeight: 700, flexShrink: 0 }}>{KIND[it.kind].label}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {confirmed && (
+                  <button onClick={() => setReviewOpen(true)} style={{ width: '100%', margin: '11px 0', background: '#FFEAF1', color: '#F0568C', border: 'none', borderRadius: 14, padding: 12, fontWeight: 800, fontSize: 13.5, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, flexShrink: 0 }}>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#F0568C" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2l2.6 6.6L22 9.3l-5 4.9 1.2 7-6.2-3.3L5.8 21l1.2-7-5-4.9 7.4-.7Z"/></svg>
+                    후기 쓰고 다음 코스 추가 할인 받기
+                  </button>
+                )}
+                <div style={{ height: 14, flexShrink: 0 }} />
               </div>
-              <button onClick={() => onSelect(c)} style={{ background: '#FF5C97', color: 'white', border: 'none', borderRadius: 12, padding: '8px 16px', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
-                선택
-              </button>
             </div>
-          ))
-        )}
-        <div style={{ height: 16 }} />
-      </div>
-    </>
-  );
-}
+          )}
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ReviewScreen
-// ═══════════════════════════════════════════════════════════════════════════════
-function ReviewScreen({ items, rating, setRating, photos, setPhotos, onClose, onSubmit, getPlaceName }: {
-  items: TimelineItem[];
-  rating: number;
-  setRating: (r: number) => void;
-  photos: boolean[];
-  setPhotos: (p: boolean[]) => void;
-  onClose: () => void;
-  onSubmit: () => void;
-  getPlaceName: (i: TimelineItem) => string;
-}) {
-  return (
-    <div style={{ position: 'absolute', inset: 0, background: 'white', overflowY: 'auto', zIndex: 90 }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '16px 16px 12px', borderBottom: '1px solid #F5F5F5', position: 'sticky', top: 0, background: 'white', zIndex: 1 }}>
-        <button onClick={onClose} style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer' }}>←</button>
-        <span style={{ fontSize: 17, fontWeight: 700 }}>후기 쓰기</span>
-      </div>
+          {/* ══ PLAN BUILD ════════════════════════════════════════ */}
+          {tab === 'plan' && planStage === 'build' && (
+            <div style={{ position: 'absolute', inset: 0, paddingTop: 56, display: 'flex', flexDirection: 'column' }}>
+              <div style={{ padding: '6px 20px 12px' }}>
+                <div style={{ textAlign: 'center', fontSize: 20, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px', marginBottom: 13 }}>코스 짜기</div>
+                {/* date picker */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#fff', borderRadius: 18, padding: '9px 11px', boxShadow: '0 8px 20px -12px rgba(0,0,0,.25)' }}>
+                  <button onClick={() => setDateIdx(d => Math.max(0, d-1))} style={{ width: 34, height: 34, border: 'none', background: '#FFE2EC', borderRadius: 11, fontSize: 17, color: '#F0568C', cursor: 'pointer', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>‹</button>
+                  <div style={{ flex: 1, textAlign: 'center', fontWeight: 800, fontSize: 16, color: '#16170F' }}>{date}</div>
+                  <button onClick={() => setDateIdx(d => Math.min(2, d+1))} style={{ width: 34, height: 34, border: 'none', background: '#FFE2EC', borderRadius: 11, fontSize: 17, color: '#F0568C', cursor: 'pointer', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>›</button>
+                </div>
+                {/* region row */}
+                <div style={{ display: 'flex', gap: 9, marginTop: 9 }}>
+                  <button onClick={() => setShowSearch(true)} style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#fff', border: '1px solid rgba(0,0,0,.05)', borderRadius: 15, padding: '12px 15px', fontWeight: 800, fontSize: 13.5, color: '#16170F', cursor: 'pointer', flexShrink: 0, boxShadow: '0 6px 16px -12px rgba(0,0,0,.3)' }}>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#FF5C97" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
+                    장소 선택
+                  </button>
+                  <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, background: '#fff', border: '1px solid rgba(0,0,0,.05)', borderRadius: 15, padding: '0 15px', fontWeight: 800, fontSize: 14, color: '#16170F', boxShadow: '0 6px 16px -12px rgba(0,0,0,.3)' }}>
+                    <span style={{ width: 11, height: 11, borderRadius: '50%', background: '#FF5C97', flexShrink: 0, display: 'block' }} />
+                    <span style={{ whiteSpace: 'nowrap' }}>{region}</span>
+                    <span style={{ marginLeft: 'auto', fontSize: 12, color: '#B5B0BC', fontWeight: 700, flexShrink: 0, whiteSpace: 'nowrap' }}>서울</span>
+                  </div>
+                </div>
+              </div>
 
-      <div style={{ padding: '16px' }}>
-        {/* Course summary */}
-        <div style={{ background: '#FBF7F9', borderRadius: 16, padding: 12, marginBottom: 20 }}>
-          {items.map((item, idx) => (
-            <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' }}>
-              <div style={{ width: 20, height: 20, background: KIND[item.kind].bar, color: 'white', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 700, flexShrink: 0 }}>{idx + 1}</div>
-              <span style={{ fontSize: 13, fontWeight: 600 }}>{getPlaceName(item)}</span>
+              {/* timeline */}
+              <div style={{ flex: 1, overflowY: 'auto', padding: '6px 18px 10px' }}>
+                <div
+                  onDragOver={e => e.preventDefault()}
+                  onDrop={e => {
+                    e.preventDefault();
+                    const kind = (e.dataTransfer.getData('kind') || e.dataTransfer.getData('text/plain')) as '식사'|'카페'|'놀거리';
+                    if (!['식사','카페','놀거리'].includes(kind)) return;
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const y = e.clientY - rect.top;
+                    const s = Math.round(Math.max(START, Math.min(ENDM-90, START + y/HOURH*60)) / 10) * 10;
+                    setItems(prev => [...prev, { id: Date.now(), kind, category: null, start: s, end: s+90, placeIdx: 0 }]);
+                  }}
+                  style={{ position: 'relative', height: HOURS * HOURH }}
+                >
+                  {/* hour grid */}
+                  {Array.from({ length: HOURS + 1 }, (_, i) => (
+                    <div key={i}>
+                      <div style={{ position: 'absolute', left: 52, right: 0, top: i * HOURH, height: 1, background: 'rgba(0,0,0,.06)' }} />
+                      <div style={{ position: 'absolute', left: 0, top: i * HOURH - 7, width: 44, textAlign: 'right', fontSize: 11, color: '#B5B0BC', fontWeight: 700 }}>{9+i}:00</div>
+                    </div>
+                  ))}
+                  {/* empty state */}
+                  {items.length === 0 && (
+                    <div style={{ position: 'absolute', left: 58, right: 8, top: 120, border: '2px dashed #E4B9CC', borderRadius: 18, padding: '28px 16px', textAlign: 'center', background: 'rgba(255,255,255,.5)' }}>
+                      <div style={{ fontSize: 14, fontWeight: 800, color: '#D584A6' }}>여기로 끌어다 놓으세요</div>
+                      <div style={{ fontSize: 11.5, color: '#C7A4B6', fontWeight: 700, marginTop: 5 }}>아래에서 식사·카페·놀거리를 드래그</div>
+                    </div>
+                  )}
+                  {/* blocks */}
+                  {items.map(it => {
+                    const k = KIND[it.kind];
+                    const top = (it.start - START) / 60 * HOURH;
+                    const h = Math.max(64, (it.end - it.start) / 60 * HOURH);
+                    return (
+                      <div key={it.id} onPointerDown={e => startDrag(e, it.id, 'move')} style={{ position: 'absolute', left: 58, right: 8, top, height: h, background: '#fff', borderRadius: 18, boxShadow: '0 12px 26px -14px rgba(0,0,0,.22)', overflow: 'hidden', cursor: 'grab', touchAction: 'none', userSelect: 'none' }}>
+                        <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 6, background: k.bar }} />
+                        <div style={{ padding: '11px 12px 11px 18px', height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 5, pointerEvents: 'none' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                            <span style={{ fontSize: 14.5, fontWeight: 800, color: '#16170F' }}>{k.label}</span>
+                            <span style={{ display: 'inline-flex', alignItems: 'center', whiteSpace: 'nowrap', flexShrink: 0, padding: '3px 9px', borderRadius: 8, fontSize: 11, fontWeight: 800, background: it.category ? k.tint : '#F1EFF4', color: it.category ? k.numText : '#A7A2B0', border: it.category ? 'none' : '1px dashed #D6D1DC' }}>{it.category ?? '종류 선택 ›'}</span>
+                          </div>
+                          <div style={{ fontSize: 12, color: '#9A96A0', fontWeight: 700 }}>{fmt(it.start)} - {fmt(it.end)}</div>
+                        </div>
+                        <button onPointerDown={e => e.stopPropagation()} onClick={() => setItems(prev => prev.filter(i => i.id !== it.id))} style={{ position: 'absolute', top: '50%', transform: 'translateY(-50%)', right: 12, width: 30, height: 30, borderRadius: '50%', border: 'none', background: '#EFEDF2', color: '#9A96A0', fontSize: 15, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>✕</button>
+                        <div onPointerDown={e => startDrag(e, it.id, 'resize')} style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 14, cursor: 'ns-resize', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <div style={{ width: 34, height: 4, borderRadius: 2, background: 'rgba(0,0,0,.1)' }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* toolbar */}
+              <div style={{ padding: '10px 18px 0', background: 'linear-gradient(to top,#EAEAF4 72%,rgba(234,234,244,0))' }}>
+                <div style={{ textAlign: 'center', fontSize: 11.5, color: '#A7A2B0', fontWeight: 700, marginBottom: 9 }}>드래그 앤 드롭으로 추가</div>
+                <div style={{ display: 'flex', gap: 9, marginBottom: 11 }}>
+                  {(['식사','카페','놀거리'] as const).map(kind => {
+                    const k = KIND[kind];
+                    return (
+                      <div key={kind} draggable onDragStart={e => { e.dataTransfer.setData('text/plain', kind); e.dataTransfer.setData('kind', kind); e.dataTransfer.effectAllowed = 'copy'; }} onClick={() => setItems(prev => { const s = firstFreeSlot(prev); return [...prev, { id: Date.now(), kind, category: null, start: s, end: s+90, placeIdx: 0 }]; })} style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, padding: '14px 8px', background: '#fff', borderRadius: 16, boxShadow: '0 6px 16px -10px rgba(0,0,0,.28)', cursor: 'grab', fontWeight: 800, fontSize: 14, color: '#16170F', userSelect: 'none' }}>
+                        <span style={{ width: 24, height: 24, borderRadius: 8, background: k.tint, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 13 }}>{KIND_ICONS[kind]}</span>
+                        {kind}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              <div style={{ padding: '0 18px 92px' }}>
+                <button onClick={() => { if (items.length === 0) { setShowSearch(true); return; } setPlanStage('final'); }} style={{ width: '100%', background: '#FF5C97', color: '#fff', border: 'none', borderRadius: 18, padding: 17, fontWeight: 800, fontSize: 16, cursor: 'pointer', boxShadow: '0 14px 30px -12px rgba(240,86,140,.65)' }}>계획 짜기</button>
+              </div>
             </div>
-          ))}
+          )}
+
+          {/* ══ PLAN FINAL ════════════════════════════════════════ */}
+          {tab === 'plan' && planStage === 'final' && (
+            <div style={{ position: 'absolute', inset: 0, paddingTop: 56 }}>
+              <div style={{ padding: '6px 18px 8px', display: 'flex', alignItems: 'center', gap: 12 }}>
+                <button onClick={() => setPlanStage('build')} style={{ width: 42, height: 42, borderRadius: 14, border: 'none', background: '#fff', boxShadow: '0 6px 16px -10px rgba(0,0,0,.3)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#16170F" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+                </button>
+                <div style={{ textAlign: 'center', flex: 1 }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px', lineHeight: 1.1 }}>추천 코스</div>
+                  <div style={{ fontSize: 12.5, color: '#9A96A0', fontWeight: 700 }}>{region} · {date}</div>
+                </div>
+                <div style={{ width: 42, flexShrink: 0 }} />
+              </div>
+
+              <div style={{ position: 'absolute', top: 108, bottom: 178, left: 0, right: 0, overflowY: 'auto', padding: '6px 16px 20px' }}>
+                {/* tier bar */}
+                <div style={{ display: 'flex', background: '#fff', borderRadius: 16, padding: 4, marginBottom: 16, boxShadow: '0 8px 20px -14px rgba(0,0,0,.25)' }}>
+                  {[1,2,3,4].map(n => {
+                    const active = partnerCount >= n;
+                    const current = partnerCount === n;
+                    return (
+                      <div key={n} style={{ flex: 1, textAlign: 'center', padding: '10px 4px', borderRadius: 13, color: active ? '#fff' : '#B5B0BC', background: active ? 'linear-gradient(135deg,#FF8FB8,#F0568C)' : 'transparent', boxShadow: current ? '0 6px 14px -6px rgba(240,86,140,.6)' : 'none', transition: 'all .2s' }}>
+                        <div style={{ fontSize: 11, fontWeight: 800 }}>{n}곳</div>
+                        <div style={{ fontSize: 14, fontWeight: 800 }}>{5*n}%</div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {/* cards */}
+                {sorted.map((it, idx) => {
+                  const k = KIND[it.kind];
+                  const partner = isPartner(it);
+                  return (
+                    <div key={it.id}>
+                      {idx > 0 && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0 8px 38px', color: '#B5B0BC', fontSize: 12, fontWeight: 700 }}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#B5B0BC" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="13" cy="4" r="1.6"/><path d="M11 8l-2 4 3 2 1 5M9 12l-3 1M14 14l3 1 1 4"/></svg>
+                          도보 {walkMins[(idx-1) % walkMins.length]}분
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', gap: 13, background: '#fff', borderRadius: 20, padding: 15, boxShadow: '0 12px 28px -16px rgba(0,0,0,.28)', marginBottom: 2 }}>
+                        <div style={{ width: 32, height: 32, borderRadius: 11, background: k.num, color: k.numText, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 15, flexShrink: 0 }}>{idx+1}</div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                            <span style={{ fontSize: 12, fontWeight: 800, color: '#16170F' }}>{fmt(it.start)}</span>
+                            <span style={{ fontSize: 11.5, color: '#B5B0BC', fontWeight: 700, whiteSpace: 'nowrap' }}>{k.label} · {it.category ?? CAT[it.kind][0]}</span>
+                            <span style={{ marginLeft: 'auto', flexShrink: 0, fontSize: 12, fontWeight: 800, padding: '4px 9px', borderRadius: 9, whiteSpace: 'nowrap', ...(partner ? { background: 'linear-gradient(135deg,#FF8FB8,#F0568C)', color: '#fff' } : { background: '#F1EFF4', color: '#A7A2B0' }) }}>{partner ? `−${r}%` : '비제휴'}</span>
+                          </div>
+                          <div style={{ fontSize: 17, fontWeight: 800, color: '#16170F', marginTop: 5 }}>{placeName(it)}</div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 6 }}>
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#B5B0BC" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
+                            <span style={{ fontSize: 12, color: '#9A96A0', fontWeight: 700 }}>{region}</span>
+                            <button onClick={() => { setSwapCandidates([]); setPlacePickerId(it.id); }} style={{ marginLeft: 'auto', background: '#F4F2F7', border: 'none', borderRadius: 11, padding: '7px 13px', fontSize: 12, fontWeight: 800, color: '#16170F', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>다른 곳 선택</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* bottom bar */}
+              <div style={{ position: 'absolute', left: 0, right: 0, bottom: 84, padding: '14px 16px 12px', zIndex: 57, background: 'linear-gradient(to top,#DEEBFF 66%,rgba(222,235,255,0))' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff', borderRadius: 22, padding: '16px 18px', boxShadow: '0 16px 36px -16px rgba(0,0,0,.3)' }}>
+                  <div>
+                    <div style={{ color: '#9A96A0', fontSize: 11.5, fontWeight: 800 }}>누적 번들 할인 · 제휴 {partnerCount}곳</div>
+                    <div style={{ color: '#F0568C', fontSize: 25, fontWeight: 800, letterSpacing: '-.5px' }}>{won(discountRawN)}</div>
+                  </div>
+                  <button onClick={() => setPlanStage('checkout')} style={{ background: '#FF5C97', color: '#fff', border: 'none', borderRadius: 15, padding: '15px 22px', fontWeight: 800, fontSize: 15, cursor: 'pointer', boxShadow: '0 12px 24px -10px rgba(240,86,140,.6)' }}>계획 확정</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ══ CHECKOUT ══════════════════════════════════════════ */}
+          {isCheckout && (
+            <div style={{ position: 'absolute', inset: 0, paddingTop: 56 }}>
+              <div style={{ padding: '6px 18px 10px', display: 'flex', alignItems: 'center', gap: 12 }}>
+                <button onClick={() => setPlanStage('final')} style={{ width: 42, height: 42, borderRadius: 14, border: 'none', background: '#fff', boxShadow: '0 6px 16px -10px rgba(0,0,0,.3)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#16170F" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+                </button>
+                <div style={{ fontSize: 20, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px' }}>결제 · 예약</div>
+              </div>
+              <div style={{ position: 'absolute', top: 108, bottom: 108, left: 0, right: 0, overflowY: 'auto', padding: '4px 16px 20px' }}>
+                {/* course items */}
+                <div style={{ background: '#fff', borderRadius: 22, padding: 18, boxShadow: '0 12px 28px -18px rgba(0,0,0,.25)', marginBottom: 14 }}>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: '#16170F', marginBottom: 14 }}>{region} 데이트 코스 · {date}</div>
+                  {sorted.map((it, idx) => {
+                    const k = KIND[it.kind];
+                    const partner = isPartner(it);
+                    return (
+                      <div key={it.id} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '9px 0', borderBottom: '1px solid #F2F0F5' }}>
+                        <div style={{ width: 30, height: 30, borderRadius: 9, background: k.num, color: k.numText, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 13, flexShrink: 0 }}>{idx+1}</div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <span style={{ fontSize: 14, fontWeight: 800, color: '#16170F' }}>{placeName(it)}</span>
+                            <span style={{ fontSize: 10, fontWeight: 800, ...(partner ? { color: '#fff', background: '#FF5C97', padding: '2px 6px', borderRadius: 6 } : { color: '#A7A2B0', background: '#EFEDF2', padding: '2px 6px', borderRadius: 6 }) }}>{partner ? '제휴' : '비제휴'}</span>
+                          </div>
+                          <div style={{ fontSize: 11.5, color: '#9A96A0', fontWeight: 700 }}>{fmt(it.start)} · {k.label} · {it.category ?? CAT[it.kind][0]}</div>
+                        </div>
+                        <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 800, color: '#16170F' }}>{won(PRICE[it.kind])}</div>
+                          {partner && <div style={{ fontSize: 11, color: '#F0568C', fontWeight: 800 }}>−{won(Math.round(PRICE[it.kind]*r/100))}</div>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {/* price summary */}
+                <div style={{ background: '#fff', borderRadius: 22, padding: '16px 18px', boxShadow: '0 12px 28px -18px rgba(0,0,0,.25)', marginBottom: 14 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', fontSize: 13, color: '#9A96A0', fontWeight: 700 }}><span>원가 합계</span><span style={{ textDecoration: 'line-through' }}>{won(subtotal)}</span></div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', fontSize: 13, color: '#F0568C', fontWeight: 800 }}><span>번들 할인 (제휴 {partnerCount}곳 · {r}%)</span><span>−{won(discountRawN)}</span></div>
+                  <div style={{ height: 1, background: '#F2F0F5', margin: '9px 0' }} />
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: 15, fontWeight: 800, color: '#16170F' }}>최종 결제 금액</span>
+                    <span style={{ fontSize: 22, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px' }}>{won(finalN)}</span>
+                  </div>
+                </div>
+                {/* payment method */}
+                <div style={{ background: '#fff', borderRadius: 22, padding: '16px 18px', boxShadow: '0 12px 28px -18px rgba(0,0,0,.25)' }}>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: '#16170F', marginBottom: 12 }}>결제 수단</div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    {['카카오페이','네이버페이','신용/체크카드'].map((label, i) => (
+                      <div key={i} onClick={() => setPayIdx(i)} style={{ flex: 1, textAlign: 'center', padding: '13px 4px', borderRadius: 13, fontSize: 12.5, fontWeight: 800, cursor: 'pointer', background: payIdx === i ? '#16170F' : '#F4F2F7', color: payIdx === i ? '#fff' : '#9A96A0', transition: 'all .15s' }}>{label}</div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, padding: '14px 16px 26px', background: 'linear-gradient(to top,#DEEBFF 70%,rgba(222,235,255,0))' }}>
+                <button onClick={() => { setPlanStage('complete'); setConfirmed(true); }} style={{ width: '100%', background: '#FF5C97', color: '#fff', border: 'none', borderRadius: 18, padding: 17, fontWeight: 800, fontSize: 16, cursor: 'pointer', boxShadow: '0 14px 30px -12px rgba(240,86,140,.65)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>{won(finalN)} 결제하고 예약</button>
+              </div>
+            </div>
+          )}
+
+          {/* ══ COMPLETE ══════════════════════════════════════════ */}
+          {isComplete && (
+            <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '32px 26px', textAlign: 'center' }}>
+              <div style={{ position: 'relative', width: 96, height: 96, marginBottom: 24 }}>
+                <span style={{ position: 'absolute', inset: 0, borderRadius: '50%', background: '#FF8FB8', animation: 'omRing 1.6s ease-out infinite' }} />
+                <span style={{ position: 'absolute', inset: 0, borderRadius: '50%', background: '#FF5C97', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 16px 34px -10px rgba(240,86,140,.6)', animation: 'omPop .4s ease-out' }}>
+                  <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12l5 5L20 6"/></svg>
+                </span>
+              </div>
+              <div style={{ fontSize: 24, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px' }}>예약이 확정됐어요</div>
+              <div style={{ fontSize: 14, color: '#9A96A0', fontWeight: 700, marginTop: 8, lineHeight: 1.5 }}>{region} 데이트 코스 {partnerCount}곳이<br/>{date} 일정으로 저장됐어요</div>
+              <div style={{ width: '100%', background: '#fff', borderRadius: 22, padding: '16px 18px', boxShadow: '0 16px 36px -20px rgba(0,0,0,.3)', marginTop: 26 }}>
+                {sorted.map((it, idx) => (
+                  <div key={it.id} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '6px 0' }}>
+                    <div style={{ width: 26, height: 26, borderRadius: 8, background: KIND[it.kind].num, color: KIND[it.kind].numText, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 12, flexShrink: 0 }}>{idx+1}</div>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: '#16170F', width: 42, textAlign: 'left' }}>{fmt(it.start)}</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: '#16170F', flex: 1, textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{placeName(it)}</div>
+                  </div>
+                ))}
+              </div>
+              <button onClick={() => setReviewOpen(true)} style={{ width: '100%', marginTop: 18, background: '#FF5C97', color: '#fff', border: 'none', borderRadius: 16, padding: 16, fontWeight: 800, fontSize: 15, cursor: 'pointer', boxShadow: '0 12px 26px -12px rgba(240,86,140,.6)' }}>후기 쓰고 5% 추가 할인 받기</button>
+              <button onClick={() => { setTab('home'); setPlanStage('build'); }} style={{ width: '100%', marginTop: 10, background: 'none', color: '#9A96A0', border: 'none', padding: 10, fontWeight: 800, fontSize: 14, cursor: 'pointer' }}>홈으로 돌아가기</button>
+            </div>
+          )}
+
+          {/* ══ CALENDAR ══════════════════════════════════════════ */}
+          {tab === 'calendar' && (
+            <div style={{ position: 'absolute', inset: 0, padding: '58px 18px 96px', overflowY: 'auto' }}>
+              <div style={{ textAlign: 'center', fontSize: 20, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px', marginBottom: 16 }}>캘린더</div>
+              <div style={{ background: '#fff', borderRadius: 24, padding: '18px 16px', boxShadow: '0 14px 32px -20px rgba(0,0,0,.25)', marginBottom: 18 }}>
+                <div style={{ textAlign: 'center', fontWeight: 800, fontSize: 16, color: '#16170F', marginBottom: 14 }}>2026년 6월</div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', marginBottom: 6 }}>
+                  {['일','월','화','수','목','금','토'].map((d, i) => (
+                    <div key={d} style={{ textAlign: 'center', fontSize: 11, fontWeight: i === 0 ? 800 : 700, color: i === 0 ? '#E5728F' : i === 6 ? '#7E96C4' : '#B5B0BC' }}>{d}</div>
+                  ))}
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', rowGap: 4 }}>
+                  {(() => {
+                    const first = new Date(2026, 5, 1).getDay();
+                    const cells = [];
+                    for (let i = 0; i < first; i++) cells.push(<div key={`e${i}`} />);
+                    for (let d = 1; d <= 30; d++) {
+                      const isToday = d === 14;
+                      cells.push(<div key={d} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto', borderRadius: 11, fontSize: 14, fontWeight: isToday ? 800 : 600, background: isToday ? '#FF5C97' : 'transparent', color: isToday ? '#fff' : '#16170F' }}>{d}</div>);
+                    }
+                    return cells;
+                  })()}
+                </div>
+              </div>
+              <div style={{ fontSize: 15, fontWeight: 800, color: '#16170F', marginBottom: 11 }}>예정된 데이트</div>
+              <div onClick={() => { setTab('plan'); setPlanStage('final'); }} style={{ display: 'flex', alignItems: 'center', gap: 13, background: '#fff', borderRadius: 18, padding: 15, boxShadow: '0 10px 26px -18px rgba(0,0,0,.25)', cursor: 'pointer' }}>
+                <div style={{ width: 48, height: 48, borderRadius: 14, background: '#FF5C97', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <div style={{ fontSize: 9, fontWeight: 800, color: '#fff', opacity: .85 }}>JUN</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: '#fff', lineHeight: 1 }}>14</div>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 14.5, fontWeight: 800, color: '#16170F' }}>{region} {partnerCount}곳 코스</div>
+                  <div style={{ fontSize: 12, color: '#9A96A0', fontWeight: 700 }}>18:00 시작 · {won(discountRawN)} 할인</div>
+                </div>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#CFC9D6" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+              </div>
+            </div>
+          )}
+
+          {/* ══ MYPAGE ════════════════════════════════════════════ */}
+          {tab === 'mypage' && (
+            <div style={{ position: 'absolute', inset: 0, padding: '58px 18px 96px', overflowY: 'auto' }}>
+              <div style={{ textAlign: 'center', fontSize: 20, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px', marginBottom: 16 }}>마이페이지</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 14, background: '#fff', borderRadius: 24, padding: 18, boxShadow: '0 14px 32px -20px rgba(0,0,0,.25)', marginBottom: 14 }}>
+                <div style={{ width: 60, height: 60, borderRadius: '50%', background: 'linear-gradient(135deg,#FF8FB8,#FF5C97)', flexShrink: 0, boxShadow: '0 0 0 5px #FFE2EC' }} />
+                <div>
+                  <div style={{ fontSize: 17, fontWeight: 800, color: '#16170F' }}>{COUPLE_NAME}</div>
+                  <div style={{ fontSize: 12.5, color: '#9A96A0', fontWeight: 700 }}>D+412 · 함께한 지 1년 1개월</div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 11, marginBottom: 16 }}>
+                <div style={{ flex: 1, background: '#fff', borderRadius: 20, padding: 16, boxShadow: '0 10px 26px -20px rgba(0,0,0,.22)' }}>
+                  <div style={{ color: '#9A96A0', fontSize: 11.5, fontWeight: 800 }}>함께한 코스</div>
+                  <div style={{ color: '#16170F', fontSize: 25, fontWeight: 800 }}>12</div>
+                </div>
+                <div style={{ flex: 1, background: 'linear-gradient(135deg,#FF8FB8,#F0568C)', borderRadius: 20, padding: 16, boxShadow: '0 10px 26px -16px rgba(240,86,140,.5)' }}>
+                  <div style={{ color: '#fff', opacity: .9, fontSize: 11.5, fontWeight: 800 }}>번들로 아낀 금액</div>
+                  <div style={{ color: '#fff', fontSize: 23, fontWeight: 800, letterSpacing: '-.5px' }}>82,000원</div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 11, background: '#16170F', borderRadius: 18, padding: '15px 16px', marginBottom: 16 }}>
+                <span style={{ width: 38, height: 38, borderRadius: 12, background: 'rgba(255,143,184,.22)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#FF8FB8" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2l2.6 6.6L22 9.3l-5 4.9 1.2 7-6.2-3.3L5.8 21l1.2-7-5-4.9 7.4-.7Z"/></svg>
+                </span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13.5, fontWeight: 800, color: '#fff' }}>원모어 크루</div>
+                  <div style={{ fontSize: 11.5, color: '#9A96A0', fontWeight: 700 }}>코스 후기 작성하고 추가 할인 받기</div>
+                </div>
+                <span style={{ background: '#FF8FB8', color: '#16170F', fontSize: 11, fontWeight: 800, padding: '5px 10px', borderRadius: 9 }}>+5%</span>
+              </div>
+              <div style={{ background: '#fff', borderRadius: 20, overflow: 'hidden', boxShadow: '0 10px 26px -20px rgba(0,0,0,.2)' }}>
+                {[{label:'저장한 코스',dot:'#8E97F2'},{label:'결제수단 · 번들 혜택',dot:'#5FC98C'},{label:'후기 · 크루 활동',dot:'#F4A65C'},{label:'알림 설정',dot:'#B5B0BC'}].map((m, i, arr) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 16, borderBottom: i < arr.length-1 ? '1px solid #F4F2F7' : 'none' }}>
+                    <span style={{ width: 9, height: 9, borderRadius: 3, background: m.dot, display: 'block' }} />
+                    <span style={{ flex: 1, fontSize: 14, fontWeight: 700, color: '#16170F' }}>{m.label}</span>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#CFC9D6" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ══ BOTTOM NAV ════════════════════════════════════════ */}
+          {showNav && (
+            <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 84, background: 'rgba(255,255,255,.92)', backdropFilter: 'blur(14px)', borderTop: '1px solid rgba(0,0,0,.04)', display: 'flex', alignItems: 'flex-start', padding: '10px 14px 0', zIndex: 55 }}>
+              {(['home','plan','calendar','mypage'] as const).map(key => {
+                const active = tab === key;
+                const c = active ? '#F0568C' : '#BBB6C2';
+                const bg = active ? '#FFD9E6' : 'transparent';
+                const labels: Record<string, string> = { home:'홈', plan:'계획', calendar:'캘린더', mypage:'마이' };
+                return (
+                  <button key={key} onClick={() => setTab(key)} style={{ flex: 1, background: 'none', border: 'none', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, cursor: 'pointer', padding: 0 }}>
+                    <div style={{ width: 46, height: 30, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 12, background: bg }}>
+                      {key === 'home'     && <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>}
+                      {key === 'plan'     && <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 6h11M8 12h11M8 18h11"/><circle cx="4" cy="6" r="1.4"/><circle cx="4" cy="12" r="1.4"/><circle cx="4" cy="18" r="1.4"/></svg>}
+                      {key === 'calendar' && <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3.5" y="5" width="17" height="16" rx="2.5"/><path d="M3.5 9.5h17M8 3.5v3M16 3.5v3"/></svg>}
+                      {key === 'mypage'   && <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="8" r="3.6"/><path d="M5 20c1.5-4 12.5-4 14 0"/></svg>}
+                    </div>
+                    <span style={{ fontSize: 10.5, fontWeight: 800, color: c }}>{labels[key]}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* home indicator */}
+          <div style={{ position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)', width: 130, height: 5, borderRadius: 3, background: '#16170F', opacity: .85, zIndex: 56 }} />
+
+          {/* ══ PLACE SEARCH SHEET ════════════════════════════════ */}
+          {showSearch && (
+            <>
+              <div onClick={() => { setShowSearch(false); setSearchInput(''); setSearchSuggestions([]); }} style={{ position: 'absolute', inset: 0, background: 'rgba(30,14,22,.42)', zIndex: 80 }} />
+              <div onClick={e => e.stopPropagation()} style={{ position: 'absolute', left: 0, right: 0, bottom: 0, background: '#FBF7F9', borderRadius: '30px 30px 0 0', zIndex: 81, padding: '12px 18px 26px', maxHeight: '74%', display: 'flex', flexDirection: 'column', animation: 'omUp .28s ease' }}>
+                <div style={{ width: 42, height: 5, borderRadius: 3, background: '#E2DCE5', margin: '2px auto 16px' }} />
+                <div style={{ fontSize: 19, fontWeight: 800, color: '#16170F', marginBottom: 13 }}>어디서 만날까요?</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 9, background: '#fff', borderRadius: 15, padding: '13px 14px', marginBottom: 14, border: '1px solid rgba(0,0,0,.05)' }}>
+                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#B5B0BC" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+                  <input value={searchInput} onChange={e => setSearchInput(e.target.value)} placeholder="지역 검색 (예: 강남, 을지로3가)" style={{ flex: 1, border: 'none', outline: 'none', fontSize: 14, color: '#16170F', fontWeight: 700, background: 'transparent' }} />
+                </div>
+                <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {displayRegions.map(reg => (
+                    <div key={reg.name} onClick={() => pickRegion(reg.name)} style={{ display: 'flex', alignItems: 'center', gap: 12, background: '#fff', borderRadius: 16, padding: '14px 15px', cursor: 'pointer', border: reg.selected ? '1.5px solid #FF5C97' : '1px solid rgba(0,0,0,.04)' }}>
+                      <div style={{ width: 40, height: 40, borderRadius: 13, background: reg.selected ? '#FF5C97' : '#F1EFF4', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={reg.selected ? '#fff' : '#B5B0BC'} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 15, fontWeight: 800, color: '#16170F' }}>{reg.name}</div>
+                        <div style={{ fontSize: 12, color: '#9A96A0', fontWeight: 700 }}>{reg.sub}</div>
+                      </div>
+                      {reg.selected && (
+                        <div style={{ width: 24, height: 24, borderRadius: '50%', background: '#FF5C97', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12l5 5L20 6"/></svg>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* ══ CATEGORY PICKER SHEET ═════════════════════════════ */}
+          {catPickerId && (() => {
+            const it = items.find(i => i.id === catPickerId);
+            if (!it) return null;
+            const k = KIND[it.kind];
+            return (
+              <>
+                <div onClick={() => setCatPickerId(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(30,14,22,.42)', zIndex: 82 }} />
+                <div onClick={e => e.stopPropagation()} style={{ position: 'absolute', left: 0, right: 0, bottom: 0, background: k.sheet, borderRadius: '30px 30px 0 0', zIndex: 83, padding: '12px 18px 30px', animation: 'omUp .28s ease' }}>
+                  <div style={{ width: 42, height: 5, borderRadius: 3, background: '#E2DCE5', margin: '2px auto 16px' }} />
+                  <div style={{ fontSize: 19, fontWeight: 800, color: '#16170F', marginBottom: 4 }}>종류 선택</div>
+                  <div style={{ fontSize: 12.5, color: '#9A96A0', fontWeight: 700, marginBottom: 18 }}>{k.label} — 어떤 분위기로 갈까요?</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+                    {CAT[it.kind].map(cat => {
+                      const selected = it.category === cat;
+                      return (
+                        <div key={cat} onClick={() => { setItems(prev => prev.map(i => i.id === catPickerId ? { ...i, category: cat, placeIdx: 0 } : i)); setCatPickerId(null); }} style={{ padding: '13px 20px', borderRadius: 30, fontSize: 15, fontWeight: 800, cursor: 'pointer', background: selected ? '#16170F' : '#fff', color: selected ? '#fff' : '#16170F', boxShadow: '0 8px 18px -12px rgba(0,0,0,.25)' }}>
+                          {cat}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </>
+            );
+          })()}
+
+          {/* ══ PLACE SWAP SHEET ══════════════════════════════════ */}
+          {placePickerId && (
+            <>
+              <div onClick={() => setPlacePickerId(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(30,14,22,.42)', zIndex: 84 }} />
+              <div onClick={e => e.stopPropagation()} style={{ position: 'absolute', left: 0, right: 0, bottom: 0, background: '#FBF7F9', borderRadius: '30px 30px 0 0', zIndex: 85, padding: '12px 18px 30px', maxHeight: '78%', display: 'flex', flexDirection: 'column', animation: 'omUp .28s ease' }}>
+                <div style={{ width: 42, height: 5, borderRadius: 3, background: '#E2DCE5', margin: '2px auto 16px' }} />
+                <div style={{ fontSize: 19, fontWeight: 800, color: '#16170F', marginBottom: 3 }}>{placePickerCat} 다른 곳</div>
+                <div style={{ fontSize: 12.5, color: '#9A96A0', fontWeight: 700, marginBottom: 8 }}>제휴 매장을 고르면 번들 할인이 유지돼요</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7, background: '#FFF0F5', borderRadius: 13, padding: '10px 13px', marginBottom: 14 }}>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#F0568C" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 8v5M12 16h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
+                  <span style={{ fontSize: 11.5, color: '#C44E7E', fontWeight: 700 }}>비제휴 매장을 고르면 그 장소는 할인에서 빠져요</span>
+                </div>
+                <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 9 }}>
+                  {placeOptions.map(po => (
+                    <div key={po.idx} onClick={() => { setItems(prev => prev.map(i => i.id === placePickerId ? { ...i, placeIdx: po.idx } : i)); setPlacePickerId(null); }} style={{ display: 'flex', alignItems: 'center', gap: 12, background: '#fff', borderRadius: 16, padding: '14px 15px', cursor: 'pointer', border: po.selected ? '1.5px solid #FF5C97' : '1px solid rgba(0,0,0,.05)', boxShadow: '0 8px 20px -16px rgba(0,0,0,.2)' }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                          <span style={{ fontSize: 15, fontWeight: 800, color: '#16170F' }}>{po.name}</span>
+                          <span style={{ fontSize: 10.5, fontWeight: 800, ...(po.partner ? { color: '#fff', background: '#FF5C97', padding: '2px 7px', borderRadius: 7 } : { color: '#A7A2B0', background: '#EFEDF2', padding: '2px 7px', borderRadius: 7 }) }}>{po.partner ? '제휴' : '비제휴'}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 3 }}>
+                          <span style={{ color: '#FFB02E', fontSize: 12 }}>★</span>
+                          <span style={{ fontSize: 12, color: '#9A96A0', fontWeight: 700 }}>{po.rating} · {po.area}</span>
+                        </div>
+                      </div>
+                      <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                        <div style={{ fontSize: po.partner ? 13 : 12, fontWeight: po.partner ? 800 : 700, color: po.partner ? '#F0568C' : '#B5B0BC' }}>{po.partner ? `−${rateFor(Math.max(1, partnerCount))}%` : '할인 없음'}</div>
+                        {po.selected && <div style={{ fontSize: 11, color: '#F0568C', fontWeight: 800, marginTop: 3 }}>선택됨</div>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* ══ REVIEW SCREEN ═════════════════════════════════════ */}
+          {reviewOpen && (
+            <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(180deg,#FFE6EF 0%,#F4EEF6 50%,#E4EDFA 100%)', zIndex: 90, display: 'flex', flexDirection: 'column', paddingTop: 56 }}>
+              <div style={{ padding: '6px 18px 10px', display: 'flex', alignItems: 'center', gap: 12 }}>
+                <button onClick={() => setReviewOpen(false)} style={{ width: 42, height: 42, borderRadius: 14, border: 'none', background: '#fff', boxShadow: '0 6px 16px -10px rgba(0,0,0,.3)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#16170F" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                </button>
+                <div style={{ fontSize: 20, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px' }}>코스 후기</div>
+              </div>
+              <div style={{ flex: 1, overflowY: 'auto', padding: '6px 18px 26px' }}>
+                <div style={{ background: '#fff', borderRadius: 20, padding: '16px 18px', boxShadow: '0 12px 28px -18px rgba(0,0,0,.25)', marginBottom: 16 }}>
+                  <div style={{ fontSize: 16, fontWeight: 800, color: '#16170F' }}>{region} 데이트 코스</div>
+                  <div style={{ fontSize: 12.5, color: '#9A96A0', fontWeight: 700, marginTop: 3 }}>{sorted.map(it => placeName(it)).join(' → ')}</div>
+                </div>
+                <div style={{ textAlign: 'center', marginBottom: 18 }}>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: '#16170F', marginBottom: 10 }}>이번 코스는 어땠나요?</div>
+                  <div style={{ display: 'flex', justifyContent: 'center', gap: 8 }}>
+                    {[1,2,3,4,5].map(i => (
+                      <button key={i} onClick={() => setRating(i)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontSize: 36, lineHeight: 1, color: i <= rating ? '#FFB02E' : '#E6DEE6' }}>★</button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ fontSize: 13.5, fontWeight: 800, color: '#16170F', marginBottom: 9 }}>사진 추가</div>
+                <div style={{ display: 'flex', gap: 10, marginBottom: 18 }}>
+                  {photos.map((filled, i) => (
+                    <div key={i} onClick={() => setPhotos(prev => { const p = [...prev]; p[i] = !p[i]; return p; })} style={{ width: 72, height: 72, borderRadius: 16, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', background: filled ? 'linear-gradient(135deg,#FF8FB8,#F0568C)' : '#fff', border: filled ? 'none' : '1.5px dashed #E4B9CC', boxShadow: '0 8px 18px -16px rgba(0,0,0,.2)' }}>
+                      {!filled
+                        ? <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#C7A4B6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                        : <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 16l5-5 4 4 3-3 6 6"/><circle cx="8.5" cy="7.5" r="1.8"/></svg>
+                      }
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontSize: 13.5, fontWeight: 800, color: '#16170F', marginBottom: 9 }}>한마디</div>
+                <textarea placeholder="우리만의 코스를 자랑해 주세요! '성수 비 오는 날 실내 데이트' 처럼 적으면 다른 커플에게 도움이 돼요." style={{ width: '100%', height: 96, border: '1px solid rgba(0,0,0,.07)', borderRadius: 16, padding: 14, fontSize: 13.5, fontFamily: 'inherit', fontWeight: 600, color: '#16170F', background: '#fff', resize: 'none', outline: 'none', lineHeight: 1.5, boxShadow: '0 8px 20px -16px rgba(0,0,0,.2)' }} />
+                <div style={{ display: 'flex', alignItems: 'center', gap: 11, background: '#16170F', borderRadius: 16, padding: '14px 16px', marginTop: 16 }}>
+                  <span style={{ width: 38, height: 38, borderRadius: 12, background: 'rgba(255,143,184,.22)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#FF8FB8" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2l2.6 6.6L22 9.3l-5 4.9 1.2 7-6.2-3.3L5.8 21l1.2-7-5-4.9 7.4-.7Z"/></svg>
+                  </span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 800, color: '#fff' }}>후기 작성 혜택</div>
+                    <div style={{ fontSize: 11.5, color: '#9A96A0', fontWeight: 700 }}>SNS에 공유하면 다음 코스 5% 추가 할인</div>
+                  </div>
+                </div>
+                <div style={{ fontSize: 13.5, fontWeight: 800, color: '#16170F', margin: '18px 0 9px' }}>함께 공유하기</div>
+                <div style={{ display: 'flex', gap: 9 }}>
+                  {[['인스타','IG','linear-gradient(135deg,#F58529,#DD2A7B,#8134AF)','#fff'],['블로그','B','#03C75A','#fff'],['플레이스','N','#03C75A','#fff'],['카카오','K','#FEE500','#3C1E1E']].map(([label, icon, bg, fg]) => (
+                    <div key={label} onClick={() => flash(`${label}에 공유했어요`)} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 7, background: '#fff', borderRadius: 16, padding: '13px 6px', boxShadow: '0 8px 20px -16px rgba(0,0,0,.2)', cursor: 'pointer', border: '1px solid rgba(0,0,0,.04)' }}>
+                      <span style={{ width: 34, height: 34, borderRadius: 11, background: bg, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 15, fontWeight: 800, color: fg }}>{icon}</span>
+                      <span style={{ fontSize: 11, fontWeight: 800, color: '#16170F' }}>{label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div style={{ padding: '12px 18px 26px', background: 'linear-gradient(to top,#E4EDFA 70%,rgba(228,237,250,0))' }}>
+                <button onClick={() => { setReviewOpen(false); setTab('home'); setPlanStage('build'); flash('후기가 등록됐어요 · 다음 코스 5% 할인'); }} style={{ width: '100%', background: '#FF5C97', color: '#fff', border: 'none', borderRadius: 18, padding: 17, fontWeight: 800, fontSize: 16, cursor: 'pointer', boxShadow: '0 14px 30px -12px rgba(240,86,140,.65)' }}>후기 등록하고 혜택 받기</button>
+              </div>
+            </div>
+          )}
+
+          {/* ══ TOAST ═════════════════════════════════════════════ */}
+          {toast && (
+            <div style={{ position: 'absolute', left: '50%', bottom: 108, transform: 'translateX(-50%)', background: '#16170F', color: '#fff', fontSize: 13, fontWeight: 800, padding: '11px 18px', borderRadius: 14, zIndex: 95, whiteSpace: 'nowrap', boxShadow: '0 14px 30px -12px rgba(0,0,0,.5)', animation: 'omUp .25s ease' }}>{toast}</div>
+          )}
+
         </div>
-
-        {/* Star rating */}
-        <div style={{ textAlign: 'center', marginBottom: 20 }}>
-          <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>데이트는 어떠셨나요?</div>
-          <div style={{ display: 'flex', justifyContent: 'center', gap: 8 }}>
-            {[1, 2, 3, 4, 5].map(s => (
-              <button key={s} onClick={() => setRating(s)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 32, color: s <= rating ? '#FF5C97' : '#E0E0E0', transition: 'color 0.15s' }}>★</button>
-            ))}
-          </div>
-        </div>
-
-        {/* Photo slots */}
-        <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
-          {photos.map((has, i) => (
-            <button key={i} onClick={() => setPhotos(photos.map((p, j) => j === i ? !p : p))} style={{ width: 88, height: 88, borderRadius: 12, border: `2px dashed ${has ? '#FF5C97' : '#E0E0E0'}`, background: has ? '#FFE8F2' : '#F9F9F9', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', fontSize: has ? 28 : 24, color: has ? '#FF5C97' : '#9A96A0' }}>
-              {has ? '🖼️' : '+'}
-            </button>
-          ))}
-        </div>
-
-        {/* Textarea */}
-        <textarea
-          placeholder="데이트는 어떠셨나요? 솔직한 후기를 남겨주세요!"
-          style={{ width: '100%', minHeight: 120, padding: '12px 14px', borderRadius: 12, border: '1.5px solid #E0E0E0', outline: 'none', fontSize: 14, resize: 'none', fontFamily: 'inherit', marginBottom: 16 }}
-        />
-
-        {/* Crew promo banner */}
-        <div style={{ background: '#1A1A2E', borderRadius: 16, padding: 14, color: 'white', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ fontSize: 20 }}>👑</span>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 13, fontWeight: 700 }}>원모어 크루 멤버가 되면</div>
-            <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.6)' }}>후기 작성 시 추가 포인트 적립!</div>
-          </div>
-          <button style={{ background: '#FF5C97', color: 'white', border: 'none', borderRadius: 10, padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>가입</button>
-        </div>
-
-        {/* Share row */}
-        <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
-          {['Instagram', '블로그', '플레이스', '카카오'].map(s => (
-            <button key={s} style={{ flex: 1, padding: '8px 0', background: '#F5F5F5', border: 'none', borderRadius: 10, fontSize: 11, color: '#555', cursor: 'pointer' }}>{s}</button>
-          ))}
-        </div>
-
-        {/* Submit */}
-        <button onClick={onSubmit} style={{ width: '100%', background: '#FF5C97', color: 'white', border: 'none', borderRadius: 16, height: 52, fontSize: 16, fontWeight: 700, cursor: 'pointer' }}>
-          후기 등록
-        </button>
       </div>
     </div>
   );
