@@ -530,14 +530,16 @@ export default function App() {
                             {!notFound && <span style={{ marginLeft: 'auto', flexShrink: 0, fontSize: 12, fontWeight: 800, padding: '4px 9px', borderRadius: 9, whiteSpace: 'nowrap', ...(partner ? { background: 'linear-gradient(135deg,#FF8FB8,#F0568C)', color: '#fff' } : { background: '#F1EFF4', color: '#A7A2B0' }) }}>{partner ? `−${r}%` : '비제휴'}</span>}
                           </div>
                           {notFound ? (
-                            <div style={{ fontSize: 14, color: '#B5B0BC', fontWeight: 700, marginTop: 5 }}>근처 2km 내 추천 장소 없음</div>
+                            <div style={{ fontSize: 13.5, color: '#B5B0BC', fontWeight: 700, marginTop: 5, lineHeight: 1.4 }}>
+                              {it.category ? `원하시는 ${it.category} 장소를 찾을 수 없어요` : '근처 2km 내 추천 장소 없음'}
+                            </div>
                           ) : (
                             <div style={{ fontSize: 17, fontWeight: 800, color: '#16170F', marginTop: 5 }}>{placeName(it)}</div>
                           )}
                           <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 6 }}>
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#B5B0BC" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
                             <span style={{ fontSize: 12, color: '#9A96A0', fontWeight: 700 }}>{region}</span>
-                            <button onClick={() => { setSwapCandidates([]); setPlacePickerId(it.id); }} style={{ marginLeft: 'auto', background: notFound ? '#FF5C97' : '#F4F2F7', color: notFound ? '#fff' : '#16170F', border: 'none', borderRadius: 11, padding: '7px 13px', fontSize: 12, fontWeight: 800, cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>{notFound ? '직접 선택하기' : '다른 곳 선택'}</button>
+                            <button onClick={() => { setSwapCandidates([]); setPlacePickerId(it.id); }} style={{ marginLeft: 'auto', background: notFound ? '#FF5C97' : '#F4F2F7', color: notFound ? '#fff' : '#16170F', border: 'none', borderRadius: 11, padding: '7px 13px', fontSize: 12, fontWeight: 800, cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>{notFound ? `가까운 ${it.kind} 확인하기` : '다른 곳 선택'}</button>
                           </div>
                         </div>
                       </div>
@@ -829,9 +831,17 @@ export default function App() {
               return null;
             };
 
-            const apiAlts = swapCandidates.filter(c =>
-              c.placeId !== swapItem.placeId && c.name !== swapItem.placeName
-            );
+            const MAX_SWAP_WALK = 25;
+            const apiAlts = swapCandidates.filter(c => {
+              if (c.placeId === swapItem.placeId || c.name === swapItem.placeName) return false;
+              if (swapPrevItem?.lat && swapPrevItem?.lng) {
+                if (approxWalkMins({ lat: swapPrevItem.lat, lng: swapPrevItem.lng }, { lat: c.lat, lng: c.lng }) > MAX_SWAP_WALK) return false;
+              }
+              if (swapNextItem?.lat && swapNextItem?.lng) {
+                if (approxWalkMins({ lat: c.lat, lng: c.lng }, { lat: swapNextItem.lat, lng: swapNextItem.lng }) > MAX_SWAP_WALK) return false;
+              }
+              return true;
+            });
             const mockAlts = MOCK_NON_PARTNER[swapItem.kind] ?? [];
 
             const selectPlace = (opts: Partial<TimelineItem>) => {
