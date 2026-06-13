@@ -1,7 +1,7 @@
 // All Google API calls go through the server-side proxy at /api/places, which
 // injects the key (server-only env var GOOGLE_MAPS_KEY). The client never sees
 // the key. When no key is configured the proxy returns { status: 'NO_API_KEY' }
-// and each function falls back to its mock/default behaviour.
+// and each function falls back gracefully.
 
 async function gCall(path: string): Promise<Record<string, unknown>> {
   const res = await fetch(`/api/places?path=${encodeURIComponent(path)}`);
@@ -64,7 +64,7 @@ const CAT_PARAMS: Record<string, { type: string; keyword: string }> = {
   '베이커리':{ type: 'bakery',    keyword: '베이커리' },
   '로스터리':{ type: 'cafe',      keyword: '스페셜티 커피 로스터리' },
   '영화':   { type: 'movie_theater', keyword: '영화관' },
-  '만화':   { type: 'amusement_park',keyword: '만화카페' },
+  // 만화카페는 Google Places 인덱스 범주가 불명확하여 제외
   '연극':   { type: 'art_gallery',   keyword: '소극장 연극' },
   '스포츠': { type: 'gym',           keyword: '스포츠 클라이밍 볼링' },
 };
@@ -75,19 +75,10 @@ const KIND_DEFAULT: Record<string, { type: string; keyword: string }> = {
   '놀거리': { type: 'tourist_attraction', keyword: '놀거리' },
 };
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
+// ─── distance helpers ──────────────────────────────────────────────────────────
 
-// Google sometimes returns "한글명 | English Name | グルメ | ..." — take only the
-// first Korean-containing segment.
-export function cleanName(raw: string): string {
-  const segments = raw.split(' | ');
-  const korean = segments.find(s => /[가-힣]/.test(s));
-  return (korean ?? segments[0]).trim();
-}
-
-// Straight-line walking estimate (haversine × 1.35 factor, 80 m/min).
-// Accurate enough for same-neighbourhood candidates (±1–2 min vs Distance Matrix).
-export function approxWalkMins(
+// Haversine straight-line distance in metres.
+function haversineDist(
   a: { lat: number; lng: number },
   b: { lat: number; lng: number },
 ): number {
@@ -96,8 +87,29 @@ export function approxWalkMins(
   const dLng = (b.lng - a.lng) * Math.PI / 180;
   const sin2 = Math.sin(dLat / 2) ** 2 +
     Math.cos(a.lat * Math.PI / 180) * Math.cos(b.lat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
-  const dist = 2 * R * Math.asin(Math.sqrt(sin2));
-  return Math.max(1, Math.round(dist * 1.35 / 80));
+  return 2 * R * Math.asin(Math.sqrt(sin2));
+}
+
+// Walking estimate: straight-line × 1.35 path factor ÷ 80 m/min. ±1–2 min vs API.
+export function approxWalkMins(
+  a: { lat: number; lng: number },
+  b: { lat: number; lng: number },
+): number {
+  return Math.max(1, Math.round(haversineDist(a, b) * 1.35 / 80));
+}
+
+// ─── name cleanup ──────────────────────────────────────────────────────────────
+
+// Google can return "한글이름 ENGLISH NAME 漢字名" or "한글 | English | 漢字".
+// Rule: if Korean is present, keep only through the last Korean character.
+//       If purely Latin (brand name like "CGV"), keep as-is.
+export function cleanName(raw: string): string {
+  const first = raw.split(' | ')[0].trim();
+  if (!/[가-힣]/.test(first)) return first; // purely Latin brand → keep
+  // Remove Japanese/Chinese scripts, collapse whitespace
+  const s = first.replace(/[぀-ヿ一-鿿]+/g, ' ').replace(/\s+/g, ' ').trim();
+  // Greedy-match everything up to and including the last Korean character sequence
+  return s.match(/^(.*[가-힣]+)/)?.[1].trim() ?? s;
 }
 
 // ─── cache ────────────────────────────────────────────────────────────────────
@@ -122,6 +134,19 @@ export async function autocompleteRegion(input: string): Promise<RegionSuggestio
 }
 
 // ─── 2. Find Nearest ──────────────────────────────────────────────────────────
+//
+// Filters applied (in order of importance):
+//   • Not CLOSED_TEMPORARILY or CLOSED_PERMANENTLY.
+//     NOTE: large chains (CGV, Megabox) often have business_status = undefined
+//     in the API — requiring === 'OPERATIONAL' would silently exclude them.
+//     Instead we only reject explicitly-closed statuses.
+//   • rating ≥ 4.0
+//   • user_ratings_total ≥ 10 (excludes ghost/new-registration listings)
+//   • haversine distance ≤ 2 km from the search hub
+//     (rankby=distance has no radius cap; without this, a category with few
+//     local options could match something 10+ km away)
+
+const MAX_DIST_M = 2000;
 
 export async function findNearest(
   hub: { lat: number; lng: number },
@@ -150,15 +175,12 @@ export async function findNearest(
       business_status?: string;
     }> = data.results || [];
 
-    // OPERATIONAL only, rating ≥ 4.0, at least 10 reviews to filter ghost listings,
-    // and within 2 km of the search hub (rankby=distance has no radius cap, so a
-    // category with few local options could otherwise match a place 10+ km away).
-    const MAX_DIST_M = 2000;
     const match = results.find(p =>
-      p.business_status === 'OPERATIONAL' &&
+      p.business_status !== 'CLOSED_TEMPORARILY' &&
+      p.business_status !== 'CLOSED_PERMANENTLY' &&
       (p.rating ?? 0) >= 4.0 &&
       (p.user_ratings_total ?? 0) >= 10 &&
-      approxWalkMins(hub, { lat: p.geometry.location.lat, lng: p.geometry.location.lng }) * 80 <= MAX_DIST_M
+      haversineDist(hub, { lat: p.geometry.location.lat, lng: p.geometry.location.lng }) <= MAX_DIST_M
     );
     if (!match) return null;
 
@@ -229,10 +251,10 @@ export async function getWalkingTimes(
         walkCache.set(cacheKeys[i], mins);
         return mins;
       }
-      return 5;
+      return 0; // 0 = no API result; caller uses approxWalkMins fallback
     });
   } catch {
-    return pairs.map(() => 5);
+    return pairs.map(() => 0);
   }
 }
 
@@ -253,7 +275,8 @@ export async function nearbySearch(
     );
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return (data.results || []).filter((p: any) =>
-      p.business_status === 'OPERATIONAL' &&
+      p.business_status !== 'CLOSED_TEMPORARILY' &&
+      p.business_status !== 'CLOSED_PERMANENTLY' &&
       (p.rating ?? 0) >= 4.0 &&
       (p.user_ratings_total ?? 0) >= 10
     ).slice(0, 8).map((p: any) => ({
@@ -264,7 +287,7 @@ export async function nearbySearch(
       lng:        p.geometry?.location?.lng ?? lng,
       photoRef:   p.photos?.[0]?.photo_reference,
       priceLevel: p.price_level,
-      isPartner:  true, // all real API results are treated as partner
+      isPartner:  true,
     }));
   } catch { return []; }
 }

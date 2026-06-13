@@ -12,7 +12,7 @@ export const WALKS = [5, 3, 8, 11, 7];
 export const CAT: Record<string, string[]> = {
   '식사': ['한식','양식','일식','중식','아시아','멕시칸','회/해물','안주'],
   '카페': ['디저트','브런치','베이커리','로스터리'],
-  '놀거리': ['영화','만화','연극','스포츠'],
+  '놀거리': ['영화','연극','스포츠'],
 };
 
 export const KIND: Record<string, { bar: string; tint: string; num: string; numText: string; sheet: string; label: string }> = {
@@ -27,11 +27,7 @@ export const PRICE: Record<string, number> = {
   '놀거리': 28000,
 };
 
-export const INITIAL_ITEMS: TimelineItem[] = [
-  { id: 1, kind: '식사', category: '양식', start: 1080, end: 1170, placeIdx: 0 },
-  { id: 2, kind: '놀거리', category: '영화', start: 1200, end: 1320, placeIdx: 0 },
-  { id: 3, kind: '카페', category: '디저트', start: 1335, end: 1395, placeIdx: 0 },
-];
+export const INITIAL_ITEMS: TimelineItem[] = [];
 
 export const COUPLE_NAME = '민준 ♥ 서연';
 

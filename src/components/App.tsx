@@ -2,7 +2,7 @@
 
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import {
-  HOURH, START, HOURS, ENDM, DATES, WALKS,
+  HOURH, START, HOURS, ENDM, DATES,
   CAT, KIND, PRICE, INITIAL_ITEMS, COUPLE_NAME, REGIONS, REGION_COORDS,
 } from '@/lib/constants';
 import type { TimelineItem } from '@/lib/types';
@@ -67,12 +67,14 @@ export default function App() {
   const [searchInput, setSearchInput] = useState('');
   const [searchSuggestions, setSearchSuggestions] = useState<RegionSuggestion[]>([]);
   const [swapCandidates, setSwapCandidates] = useState<PlaceCandidate[]>([]);
-  const [walkMins, setWalkMins] = useState<number[]>(WALKS);
+  const [walkMins, setWalkMins] = useState<number[]>([]);
   const [isRecommending, setIsRecommending] = useState(false);
+  const [hasRecommended, setHasRecommended] = useState(false);
 
   const toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const mapDragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
   const tlDragRef = useRef<{ id: number; mode: 'move' | 'resize'; startY: number; os: number; oe: number; moved: number } | null>(null);
+  const tlScrollRef = useRef<HTMLDivElement>(null);
 
   const flash = useCallback((msg: string) => {
     setToast(msg);
@@ -90,16 +92,37 @@ export default function App() {
     return () => clearTimeout(t);
   }, [searchInput]);
 
-  // batch walk times when places have coordinates
+  // Walk times: set approx immediately from coords, then update with Distance Matrix API.
+  // getWalkingTimes returns 0 for missing results; approxWalkMins fills those in.
   useEffect(() => {
     const sorted = [...items].sort((a, b) => a.start - b.start);
-    if (sorted.length < 2) return;
+    if (sorted.length < 2) { setWalkMins([]); return; }
+
+    // Immediate approx (no API call needed)
+    const approx = sorted.slice(1).map((it, i) => {
+      const prev = sorted[i];
+      if (prev.lat && prev.lng && it.lat && it.lng)
+        return approxWalkMins({ lat: prev.lat, lng: prev.lng }, { lat: it.lat, lng: it.lng });
+      return 5;
+    });
+    setWalkMins(approx);
+
+    // Then try Distance Matrix for real times (only when all items have coords)
     if (!sorted.every(it => it.lat && it.lng)) return;
     const places = sorted.map(it => ({ placeId: it.placeId ?? String(it.id), lat: it.lat!, lng: it.lng! }));
     getWalkingTimes(places).then(mins => {
-      if (mins.length) setWalkMins(mins.map((m, i) => m || WALKS[i]));
+      if (!mins.length) return;
+      setWalkMins(mins.map((m, i) => m > 0 ? m : approx[i]));
     });
   }, [items]);
+
+  // Scroll timeline to 15:00 on first open of the plan-build tab
+  useEffect(() => {
+    if (tab === 'plan' && planStage === 'build' && tlScrollRef.current) {
+      // 15:00 = 900 min; offset from START (540) = 360 min; 64px/h → 384px
+      tlScrollRef.current.scrollTop = (15 * 60 - START) / 60 * HOURH;
+    }
+  }, [tab, planStage]);
 
   // fetch swap candidates from Nearby Search
   useEffect(() => {
@@ -255,7 +278,7 @@ export default function App() {
                   {sorted.slice(0, 4).map((_, idx) => idx > 0 && (
                     <div key={idx} style={{ position: 'absolute', left: `${(POS[idx-1][0]+POS[idx][0])/2}%`, top: `${(POS[idx-1][1]+POS[idx][1])/2}%`, transform: 'translate(-50%,-50%)', zIndex: 4 }}>
                       <div style={{ background: '#FF5C97', color: '#fff', fontSize: 10, fontWeight: 800, padding: '3px 8px', borderRadius: 9, whiteSpace: 'nowrap', boxShadow: '0 4px 10px -3px rgba(240,86,140,.5)' }}>
-                        도보 {walkMins[(idx-1) % walkMins.length]}분
+                        도보 {walkMins.length > 0 ? walkMins[Math.min(idx-1, walkMins.length-1)] : 5}분
                       </div>
                     </div>
                   ))}
@@ -312,7 +335,7 @@ export default function App() {
                       {idx > 0 && (
                         <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0 2px 13px' }}>
                           <div style={{ width: 1, height: 12, borderLeft: '1.5px dashed #D8D4DE' }} />
-                          <span style={{ fontSize: 10, color: '#B5B0BC', fontWeight: 700 }}>도보 {walkMins[(idx-1) % walkMins.length]}분</span>
+                          <span style={{ fontSize: 10, color: '#B5B0BC', fontWeight: 700 }}>도보 {walkMins.length > 0 ? walkMins[Math.min(idx-1, walkMins.length-1)] : 5}분</span>
                         </div>
                       )}
                       <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '2px 0' }}>
@@ -361,7 +384,7 @@ export default function App() {
               </div>
 
               {/* timeline */}
-              <div style={{ flex: 1, overflowY: 'auto', padding: '6px 18px 10px' }}>
+              <div ref={tlScrollRef} style={{ flex: 1, overflowY: 'auto', padding: '6px 18px 10px' }}>
                 <div
                   onDragOver={e => e.preventDefault()}
                   onDrop={e => {
@@ -447,6 +470,7 @@ export default function App() {
                       }
                     } finally {
                       setIsRecommending(false);
+                      setHasRecommended(true);
                       setPlanStage('final');
                     }
                   }}
@@ -488,27 +512,32 @@ export default function App() {
                 {sorted.map((it, idx) => {
                   const k = KIND[it.kind];
                   const partner = isPartner(it);
+                  const notFound = hasRecommended && !it.placeName;
                   return (
                     <div key={it.id}>
                       {idx > 0 && (
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 0 8px 38px', color: '#B5B0BC', fontSize: 12, fontWeight: 700 }}>
                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#B5B0BC" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="13" cy="4" r="1.6"/><path d="M11 8l-2 4 3 2 1 5M9 12l-3 1M14 14l3 1 1 4"/></svg>
-                          도보 {walkMins[(idx-1) % walkMins.length]}분
+                          {idx - 1 < walkMins.length ? `도보 ${walkMins[idx-1]}분` : '도보 ?분'}
                         </div>
                       )}
-                      <div style={{ display: 'flex', gap: 13, background: '#fff', borderRadius: 20, padding: 15, boxShadow: '0 12px 28px -16px rgba(0,0,0,.28)', marginBottom: 2 }}>
-                        <div style={{ width: 32, height: 32, borderRadius: 11, background: k.num, color: k.numText, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 15, flexShrink: 0 }}>{idx+1}</div>
+                      <div style={{ display: 'flex', gap: 13, background: notFound ? '#FAF8FA' : '#fff', borderRadius: 20, padding: 15, boxShadow: '0 12px 28px -16px rgba(0,0,0,.28)', marginBottom: 2, border: notFound ? '1.5px dashed #E2DCE5' : 'none' }}>
+                        <div style={{ width: 32, height: 32, borderRadius: 11, background: notFound ? '#F1EFF4' : k.num, color: notFound ? '#B5B0BC' : k.numText, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 800, fontSize: 15, flexShrink: 0 }}>{idx+1}</div>
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                            <span style={{ fontSize: 12, fontWeight: 800, color: '#16170F' }}>{fmt(it.start)}</span>
+                            <span style={{ fontSize: 12, fontWeight: 800, color: notFound ? '#B5B0BC' : '#16170F' }}>{fmt(it.start)}</span>
                             <span style={{ fontSize: 11.5, color: '#B5B0BC', fontWeight: 700, whiteSpace: 'nowrap' }}>{k.label} · {it.category ?? CAT[it.kind][0]}</span>
-                            <span style={{ marginLeft: 'auto', flexShrink: 0, fontSize: 12, fontWeight: 800, padding: '4px 9px', borderRadius: 9, whiteSpace: 'nowrap', ...(partner ? { background: 'linear-gradient(135deg,#FF8FB8,#F0568C)', color: '#fff' } : { background: '#F1EFF4', color: '#A7A2B0' }) }}>{partner ? `−${r}%` : '비제휴'}</span>
+                            {!notFound && <span style={{ marginLeft: 'auto', flexShrink: 0, fontSize: 12, fontWeight: 800, padding: '4px 9px', borderRadius: 9, whiteSpace: 'nowrap', ...(partner ? { background: 'linear-gradient(135deg,#FF8FB8,#F0568C)', color: '#fff' } : { background: '#F1EFF4', color: '#A7A2B0' }) }}>{partner ? `−${r}%` : '비제휴'}</span>}
                           </div>
-                          <div style={{ fontSize: 17, fontWeight: 800, color: '#16170F', marginTop: 5 }}>{placeName(it)}</div>
+                          {notFound ? (
+                            <div style={{ fontSize: 14, color: '#B5B0BC', fontWeight: 700, marginTop: 5 }}>근처 2km 내 추천 장소 없음</div>
+                          ) : (
+                            <div style={{ fontSize: 17, fontWeight: 800, color: '#16170F', marginTop: 5 }}>{placeName(it)}</div>
+                          )}
                           <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 6 }}>
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#B5B0BC" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
                             <span style={{ fontSize: 12, color: '#9A96A0', fontWeight: 700 }}>{region}</span>
-                            <button onClick={() => { setSwapCandidates([]); setPlacePickerId(it.id); }} style={{ marginLeft: 'auto', background: '#F4F2F7', border: 'none', borderRadius: 11, padding: '7px 13px', fontSize: 12, fontWeight: 800, color: '#16170F', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>다른 곳 선택</button>
+                            <button onClick={() => { setSwapCandidates([]); setPlacePickerId(it.id); }} style={{ marginLeft: 'auto', background: notFound ? '#FF5C97' : '#F4F2F7', color: notFound ? '#fff' : '#16170F', border: 'none', borderRadius: 11, padding: '7px 13px', fontSize: 12, fontWeight: 800, cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>{notFound ? '직접 선택하기' : '다른 곳 선택'}</button>
                           </div>
                         </div>
                       </div>
