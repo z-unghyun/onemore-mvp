@@ -47,12 +47,10 @@ const KIND_ICONS: Record<string, string> = { '식사': '🍴', '카페': '☕', 
 
 export default function App() {
   // survey mode: ?mode=survey 파라미터가 있으면 캘린더/마이 탭 숨김
-  const [surveyMode] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return new URLSearchParams(window.location.search).get('mode') === 'survey';
-    }
-    return false;
-  });
+  const [surveyMode, setSurveyMode] = useState(false);
+  useEffect(() => {
+    setSurveyMode(new URLSearchParams(window.location.search).get('mode') === 'survey');
+  }, []);
 
   // state mirrors the prototype exactly (tab starts on 'plan')
   const [mapPan, setMapPan] = useState({ x: 0, y: 0 });
