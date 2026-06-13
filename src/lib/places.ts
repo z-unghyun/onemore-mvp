@@ -1,5 +1,3 @@
-// ─── config ──────────────────────────────────────────────────────────────────
-
 // All Google API calls go through the server-side proxy at /api/places, which
 // injects the key (server-only env var GOOGLE_MAPS_KEY). The client never sees
 // the key. When no key is configured the proxy returns { status: 'NO_API_KEY' }
@@ -39,8 +37,7 @@ export interface CoursePlace {
   isPartner: boolean;
 }
 
-// ─── transit hubs ────────────────────────────────────────────────────────────
-// 지역별 거점역 좌표 (Nearby Search 출발점)
+// ─── transit hubs ─────────────────────────────────────────────────────────────
 
 export const TRANSIT_HUBS: Record<string, { lat: number; lng: number; station: string }> = {
   '강남':    { lat: 37.4979, lng: 127.0276, station: '강남역' },
@@ -51,7 +48,7 @@ export const TRANSIT_HUBS: Record<string, { lat: number; lng: number; station: s
   '연남':    { lat: 37.5543, lng: 126.9228, station: '홍대입구역' },
 };
 
-// ─── category → Places API search params ─────────────────────────────────────
+// ─── category → Places API search params ──────────────────────────────────────
 
 const CAT_PARAMS: Record<string, { type: string; keyword: string }> = {
   '한식':   { type: 'restaurant', keyword: '한식' },
@@ -78,8 +75,32 @@ const KIND_DEFAULT: Record<string, { type: string; keyword: string }> = {
   '놀거리': { type: 'tourist_attraction', keyword: '놀거리' },
 };
 
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+// Google sometimes returns "한글명 | English Name | グルメ | ..." — take only the
+// first Korean-containing segment.
+export function cleanName(raw: string): string {
+  const segments = raw.split(' | ');
+  const korean = segments.find(s => /[가-힣]/.test(s));
+  return (korean ?? segments[0]).trim();
+}
+
+// Straight-line walking estimate (haversine × 1.35 factor, 80 m/min).
+// Accurate enough for same-neighbourhood candidates (±1–2 min vs Distance Matrix).
+export function approxWalkMins(
+  a: { lat: number; lng: number },
+  b: { lat: number; lng: number },
+): number {
+  const R = 6371000;
+  const dLat = (b.lat - a.lat) * Math.PI / 180;
+  const dLng = (b.lng - a.lng) * Math.PI / 180;
+  const sin2 = Math.sin(dLat / 2) ** 2 +
+    Math.cos(a.lat * Math.PI / 180) * Math.cos(b.lat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  const dist = 2 * R * Math.asin(Math.sqrt(sin2));
+  return Math.max(1, Math.round(dist * 1.35 / 80));
+}
+
 // ─── cache ────────────────────────────────────────────────────────────────────
-// (placeId_A, placeId_B) → walkMinutes  — persists for lifetime of the page
 
 const walkCache = new Map<string, number>();
 
@@ -100,8 +121,7 @@ export async function autocompleteRegion(input: string): Promise<RegionSuggestio
   } catch { return []; }
 }
 
-// ─── 2. Find Nearest (거점 기준 가장 가까운 별점 4.0+ 장소) ──────────────────
-// rankby=distance → radius 없이 가까운 순으로 반환, 클라이언트에서 rating 필터
+// ─── 2. Find Nearest ──────────────────────────────────────────────────────────
 
 export async function findNearest(
   hub: { lat: number; lng: number },
@@ -129,35 +149,25 @@ export async function findNearest(
       business_status?: string;
     }> = data.results || [];
 
-    // 별점 4.0 이상 + 영업 중인 곳 중 가장 가까운 곳 (이미 거리순 정렬)
     const match = results.find(p =>
       (p.rating ?? 0) >= 4.0 &&
       p.business_status !== 'CLOSED_PERMANENTLY'
     );
-
     if (!match) return null;
 
     return {
       placeId:  match.place_id,
-      name:     match.name,
+      name:     cleanName(match.name),
       lat:      match.geometry.location.lat,
       lng:      match.geometry.location.lng,
       rating:   match.rating ?? 4.0,
       photoRef: match.photos?.[0]?.photo_reference,
-      isPartner: false, // 실 DB 없으므로 일단 false; 추후 partner_places 테이블로 join
+      isPartner: true,
     };
   } catch { return null; }
 }
 
-// ─── 3. Course Recommendation (체인 추천) ────────────────────────────────────
-//
-// 알고리즘:
-//   hub = 거점역 좌표
-//   for each item (시간순):
-//     place = findNearest(hub, item.category, item.kind)  → 1 API call
-//     hub   = place.lat/lng   (다음 탐색 기준점 갱신)
-//
-// API 호출 수 = items.length (Nearby Search) + 1 (Distance Matrix)
+// ─── 3. Course Recommendation ─────────────────────────────────────────────────
 
 export async function recommendCourse(
   items: Array<{ id: number; kind: string; category: string | null }>,
@@ -180,19 +190,13 @@ export async function recommendCourse(
   return result;
 }
 
-// ─── 4. Distance Matrix (도보 시간 일괄 조회) ─────────────────────────────────
-//
-// N개 장소 → N-1 구간을 Distance Matrix 1회 호출로 처리
-// origins    = place[0..N-2]
-// destinations = place[1..N-1]
-// 응답 matrix[i][i] = i번째 구간 이동 시간
+// ─── 4. Distance Matrix ───────────────────────────────────────────────────────
 
 export async function getWalkingTimes(
   places: Array<{ placeId: string; lat: number; lng: number }>,
 ): Promise<number[]> {
   if (places.length < 2) return [];
 
-  // 캐시 확인 — 모든 구간이 캐시에 있으면 API 호출 생략
   const pairs = places.slice(0, -1).map((p, i) => ({ a: p, b: places[i + 1] }));
   const cacheKeys = pairs.map(p => `${p.a.placeId}__${p.b.placeId}`);
   if (cacheKeys.every(k => walkCache.has(k))) {
@@ -211,51 +215,50 @@ export async function getWalkingTimes(
     const rows: Array<{ elements: Array<{ duration?: { value: number }; status: string }> }> =
       data.rows || [];
 
-    return pairs.map((pair, i) => {
+    return pairs.map((_pair, i) => {
       const el = rows[i]?.elements[i];
       if (el?.status === 'OK') {
         const mins = Math.ceil((el.duration?.value ?? 300) / 60);
-        walkCache.set(cacheKeys[i], mins); // only cache real results
+        walkCache.set(cacheKeys[i], mins);
         return mins;
       }
-      return 5; // fallback (no key / no route) — not cached, retried when key present
+      return 5;
     });
   } catch {
     return pairs.map(() => 5);
   }
 }
 
-// ─── 5. PlaceSwapSheet 용 후보 목록 ──────────────────────────────────────────
+// ─── 5. Nearby Search (swap sheet candidates) ─────────────────────────────────
 
 export async function nearbySearch(
   lat: number, lng: number,
-  category: string, keyword: string,
+  category: string,
 ): Promise<PlaceCandidate[]> {
   try {
-    // category 는 한글 분류(예: '디저트')일 수 있으므로 Google type/keyword 로 변환
     const mapped = CAT_PARAMS[category];
     const type = mapped?.type ?? 'restaurant';
-    const kw = mapped?.keyword || keyword;
+    const kw = mapped?.keyword ?? '';
     const kwParam = kw ? `&keyword=${encodeURIComponent(kw)}` : '';
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const data: any = await gCall(
       `/place/nearbysearch/json?location=${lat},${lng}&rankby=distance&type=${type}${kwParam}&language=ko`
     );
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (data.results || []).slice(0, 5).map((p: any, i: number) => ({
+    return (data.results || []).slice(0, 8).map((p: any) => ({
       placeId:    p.place_id,
-      name:       p.name,
-      rating:     p.rating || 4.0,
-      lat:        p.geometry?.location?.lat || lat,
-      lng:        p.geometry?.location?.lng || lng,
+      name:       cleanName(p.name),
+      rating:     p.rating ?? 4.0,
+      lat:        p.geometry?.location?.lat ?? lat,
+      lng:        p.geometry?.location?.lng ?? lng,
       photoRef:   p.photos?.[0]?.photo_reference,
       priceLevel: p.price_level,
-      isPartner:  i < 2,
+      isPartner:  true, // all real API results are treated as partner
     }));
   } catch { return []; }
 }
 
-// ─── 6. 단일 도보 시간 (Directions — 직접 호출용, fallback) ──────────────────
+// ─── 6. Single walking time (Directions fallback) ─────────────────────────────
 
 export async function getWalkingMinutes(
   origin: { lat: number; lng: number },
@@ -273,6 +276,5 @@ export async function getWalkingMinutes(
 // ─── 7. Photo URL ─────────────────────────────────────────────────────────────
 
 export function photoUrl(ref: string, maxWidth = 400): string {
-  // Routed through the server proxy so the key is never exposed client-side.
   return `/api/places/photo?ref=${encodeURIComponent(ref)}&w=${maxWidth}`;
 }

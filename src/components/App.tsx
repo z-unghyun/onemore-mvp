@@ -3,10 +3,10 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import {
   HOURH, START, HOURS, ENDM, DATES, WALKS,
-  CAT, NAMES, KIND, PRICE, INITIAL_ITEMS, COUPLE_NAME, REGIONS, REGION_COORDS,
+  CAT, KIND, PRICE, INITIAL_ITEMS, COUPLE_NAME, REGIONS, REGION_COORDS,
 } from '@/lib/constants';
 import type { TimelineItem } from '@/lib/types';
-import { autocompleteRegion, nearbySearch, recommendCourse, getWalkingTimes } from '@/lib/places';
+import { autocompleteRegion, nearbySearch, recommendCourse, getWalkingTimes, approxWalkMins } from '@/lib/places';
 import type { RegionSuggestion, PlaceCandidate } from '@/lib/places';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -18,21 +18,20 @@ function fmt(m: number) {
 function won(n: number) { return n.toLocaleString('ko-KR') + '원'; }
 function rateFor(cnt: number) { return Math.min(30, 5 * cnt); }
 
-function getCandidates(it: TimelineItem) {
-  const cat = it.category ?? CAT[it.kind][0];
-  const arr = NAMES[cat] ?? NAMES[CAT[it.kind][0]];
-  return arr.map((name, i) => ({ name, partner: i < 2, rating: (4.9 - i * 0.2).toFixed(1) }));
-}
 function placeName(it: TimelineItem) {
-  if (it.placeName) return it.placeName;
-  const c = getCandidates(it);
-  return c[(it.placeIdx ?? 0) % c.length].name;
+  return it.placeName ?? it.category ?? it.kind;
 }
 function isPartner(it: TimelineItem) {
-  if (it.isPartner !== undefined) return it.isPartner;
-  const c = getCandidates(it);
-  return c[(it.placeIdx ?? 0) % c.length].partner;
+  return it.isPartner ?? false;
 }
+
+// Mock non-partner entries per kind — shown at the bottom of the swap sheet to
+// demonstrate the flow where selecting a non-partner removes the discount.
+const MOCK_NON_PARTNER: Record<string, Array<{ name: string; rating: number }>> = {
+  '식사':   [{ name: '동네 한식당', rating: 4.1 }, { name: '오늘의 식탁', rating: 3.9 }],
+  '카페':   [{ name: '동네 카페', rating: 4.0 }, { name: '커피 한 잔', rating: 3.9 }],
+  '놀거리': [{ name: '근처 놀거리', rating: 4.0 }, { name: '주변 즐길거리', rating: 3.9 }],
+};
 function firstFreeSlot(items: TimelineItem[]) {
   const dur = 90;
   const sorted = [...items].sort((a, b) => a.start - b.start);
@@ -108,9 +107,10 @@ export default function App() {
     const it = items.find(i => i.id === placePickerId);
     if (!it) return;
     const cat = it.category ?? CAT[it.kind][0];
-    const coords = REGION_COORDS[region];
+    // Use the current item's own coords as the search hub if available, otherwise region centre
+    const coords = (it.lat && it.lng) ? { lat: it.lat, lng: it.lng } : REGION_COORDS[region];
     if (!coords) return;
-    nearbySearch(coords.lat, coords.lng, cat, cat).then(r => { if (r.length) setSwapCandidates(r); });
+    nearbySearch(coords.lat, coords.lng, cat).then(r => { if (r.length) setSwapCandidates(r); });
   }, [placePickerId, items, region]);
 
   // ── map pan ────────────────────────────────────────────────────
@@ -184,19 +184,12 @@ export default function App() {
     ? searchSuggestions.map(s => ({ name: s.name, sub: s.sub, selected: region === s.name }))
     : REGIONS.map(r => ({ name: r.name, sub: r.sub, selected: region === r.name }));
 
-  // place swap candidates
-  let placeOptions: Array<{ name: string; partner: boolean; rating: string; area: string; selected: boolean; idx: number }> = [];
-  let placePickerCat = '';
-  if (placePickerId) {
-    const it = items.find(i => i.id === placePickerId);
-    if (it) {
-      placePickerCat = it.category ?? CAT[it.kind][0];
-      const base = swapCandidates.length
-        ? swapCandidates.map((c, i) => ({ name: c.name, partner: c.isPartner, rating: c.rating.toFixed(1), idx: i }))
-        : getCandidates(it).map((c, i) => ({ ...c, idx: i }));
-      placeOptions = base.map(c => ({ ...c, area: region, selected: (it.placeIdx ?? 0) % base.length === c.idx }));
-    }
-  }
+  // swap sheet — derive context for the selected item
+  const swapItem = placePickerId ? items.find(i => i.id === placePickerId) : null;
+  const swapItemSortedIdx = swapItem ? sorted.findIndex(i => i.id === swapItem.id) : -1;
+  const swapPrevItem = swapItemSortedIdx > 0 ? sorted[swapItemSortedIdx - 1] : null;
+  const swapNextItem = swapItemSortedIdx < sorted.length - 1 ? sorted[swapItemSortedIdx + 1] : null;
+  const placePickerCat = swapItem ? (swapItem.category ?? CAT[swapItem.kind][0]) : '';
 
   const pickRegion = (name: string) => {
     setRegion(name);
@@ -791,40 +784,100 @@ export default function App() {
           })()}
 
           {/* ══ PLACE SWAP SHEET ══════════════════════════════════ */}
-          {placePickerId && (
-            <>
-              <div onClick={() => setPlacePickerId(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(30,14,22,.42)', zIndex: 84 }} />
-              <div onClick={e => e.stopPropagation()} style={{ position: 'absolute', left: 0, right: 0, bottom: 0, background: '#FBF7F9', borderRadius: '30px 30px 0 0', zIndex: 85, padding: '12px 18px 30px', maxHeight: '78%', display: 'flex', flexDirection: 'column', animation: 'omUp .28s ease' }}>
-                <div style={{ width: 42, height: 5, borderRadius: 3, background: '#E2DCE5', margin: '2px auto 16px' }} />
-                <div style={{ fontSize: 19, fontWeight: 800, color: '#16170F', marginBottom: 3 }}>{placePickerCat} 다른 곳</div>
-                <div style={{ fontSize: 12.5, color: '#9A96A0', fontWeight: 700, marginBottom: 8 }}>제휴 매장을 고르면 번들 할인이 유지돼요</div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 7, background: '#FFF0F5', borderRadius: 13, padding: '10px 13px', marginBottom: 14 }}>
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#F0568C" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 8v5M12 16h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
-                  <span style={{ fontSize: 11.5, color: '#C44E7E', fontWeight: 700 }}>비제휴 매장을 고르면 그 장소는 할인에서 빠져요</span>
-                </div>
-                <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 9 }}>
-                  {placeOptions.map(po => (
-                    <div key={po.idx} onClick={() => { setItems(prev => prev.map(i => i.id === placePickerId ? { ...i, placeIdx: po.idx } : i)); setPlacePickerId(null); }} style={{ display: 'flex', alignItems: 'center', gap: 12, background: '#fff', borderRadius: 16, padding: '14px 15px', cursor: 'pointer', border: po.selected ? '1.5px solid #FF5C97' : '1px solid rgba(0,0,0,.05)', boxShadow: '0 8px 20px -16px rgba(0,0,0,.2)' }}>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                          <span style={{ fontSize: 15, fontWeight: 800, color: '#16170F' }}>{po.name}</span>
-                          <span style={{ fontSize: 10.5, fontWeight: 800, ...(po.partner ? { color: '#fff', background: '#FF5C97', padding: '2px 7px', borderRadius: 7 } : { color: '#A7A2B0', background: '#EFEDF2', padding: '2px 7px', borderRadius: 7 }) }}>{po.partner ? '제휴' : '비제휴'}</span>
-                        </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 3 }}>
-                          <span style={{ color: '#FFB02E', fontSize: 12 }}>★</span>
-                          <span style={{ fontSize: 12, color: '#9A96A0', fontWeight: 700 }}>{po.rating} · {po.area}</span>
-                        </div>
-                      </div>
-                      <div style={{ textAlign: 'right', flexShrink: 0 }}>
-                        <div style={{ fontSize: po.partner ? 13 : 12, fontWeight: po.partner ? 800 : 700, color: po.partner ? '#F0568C' : '#B5B0BC' }}>{po.partner ? `−${rateFor(Math.max(1, partnerCount))}%` : '할인 없음'}</div>
-                        {po.selected && <div style={{ fontSize: 11, color: '#F0568C', fontWeight: 800, marginTop: 3 }}>선택됨</div>}
-                      </div>
+          {placePickerId && swapItem && (() => {
+            const discountPct = rateFor(Math.max(1, partnerCount));
+
+            const walkLabel = (lat?: number, lng?: number) => {
+              if (!lat || !lng) return null;
+              const coord = { lat, lng };
+              const toPrev = (swapPrevItem?.lat && swapPrevItem?.lng)
+                ? approxWalkMins({ lat: swapPrevItem.lat, lng: swapPrevItem.lng }, coord) : null;
+              const toNext = (swapNextItem?.lat && swapNextItem?.lng)
+                ? approxWalkMins(coord, { lat: swapNextItem.lat, lng: swapNextItem.lng }) : null;
+              if (toPrev !== null && toNext !== null) return `도보 ${toPrev}분 · ${toNext}분`;
+              if (toPrev !== null) return `이전 도보 ${toPrev}분`;
+              if (toNext !== null) return `다음 도보 ${toNext}분`;
+              return null;
+            };
+
+            const apiAlts = swapCandidates.filter(c =>
+              c.placeId !== swapItem.placeId && c.name !== swapItem.placeName
+            );
+            const mockAlts = MOCK_NON_PARTNER[swapItem.kind] ?? [];
+
+            const selectPlace = (opts: Partial<TimelineItem>) => {
+              setItems(prev => prev.map(i => i.id === placePickerId ? { ...i, ...opts } : i));
+              setPlacePickerId(null);
+            };
+
+            const SwapCard = ({ name, partner, rating, lat, lng, placeId, selected, onSelect }: {
+              name: string; partner: boolean; rating: number;
+              lat?: number; lng?: number; placeId?: string;
+              selected: boolean; onSelect: () => void;
+            }) => {
+              const wl = walkLabel(lat, lng);
+              return (
+                <div onClick={onSelect} style={{ display: 'flex', alignItems: 'center', gap: 12, background: '#fff', borderRadius: 16, padding: '13px 15px', cursor: 'pointer', border: selected ? '1.5px solid #FF5C97' : '1px solid rgba(0,0,0,.05)', boxShadow: selected ? '0 8px 24px -12px rgba(240,86,140,.25)' : '0 4px 14px -10px rgba(0,0,0,.18)', marginBottom: 8 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                      <span style={{ fontSize: 15, fontWeight: 800, color: '#16170F', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+                      <span style={{ fontSize: 10.5, fontWeight: 800, flexShrink: 0, padding: '2px 7px', borderRadius: 7, ...(partner ? { color: '#fff', background: '#FF5C97' } : { color: '#A7A2B0', background: '#EFEDF2' }) }}>{partner ? '제휴' : '비제휴'}</span>
                     </div>
-                  ))}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 4 }}>
+                      <span style={{ color: '#FFB02E', fontSize: 11 }}>★</span>
+                      <span style={{ fontSize: 11.5, color: '#9A96A0', fontWeight: 700 }}>{rating.toFixed(1)} · {region}</span>
+                      {wl && <><span style={{ color: '#DDD8E3', fontSize: 10 }}>·</span><span style={{ fontSize: 11, color: '#B5B0BC', fontWeight: 700 }}>{wl}</span></>}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'right', flexShrink: 0, minWidth: 56 }}>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: partner ? '#F0568C' : '#B5B0BC' }}>{partner ? `−${discountPct}%` : '할인 없음'}</div>
+                    {selected && <div style={{ fontSize: 10.5, color: '#F0568C', fontWeight: 800, marginTop: 2 }}>선택됨</div>}
+                  </div>
                 </div>
-              </div>
-            </>
-          )}
+              );
+            };
+
+            return (
+              <>
+                <div onClick={() => setPlacePickerId(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(30,14,22,.42)', zIndex: 84 }} />
+                <div onClick={e => e.stopPropagation()} style={{ position: 'absolute', left: 0, right: 0, bottom: 0, background: '#FBF7F9', borderRadius: '30px 30px 0 0', zIndex: 85, padding: '12px 18px 30px', maxHeight: '80%', display: 'flex', flexDirection: 'column', animation: 'omUp .28s ease' }}>
+                  <div style={{ width: 42, height: 5, borderRadius: 3, background: '#E2DCE5', margin: '2px auto 16px' }} />
+                  <div style={{ fontSize: 19, fontWeight: 800, color: '#16170F', marginBottom: 3 }}>{placePickerCat} 다른 곳</div>
+                  <div style={{ fontSize: 12.5, color: '#9A96A0', fontWeight: 700, marginBottom: 10 }}>제휴 매장을 고르면 번들 할인이 유지돼요</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 7, background: '#FFF0F5', borderRadius: 13, padding: '10px 13px', marginBottom: 14, flexShrink: 0 }}>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#F0568C" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 8v5M12 16h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
+                    <span style={{ fontSize: 11.5, color: '#C44E7E', fontWeight: 700 }}>비제휴 매장을 고르면 그 장소는 할인에서 빠져요</span>
+                  </div>
+                  <div style={{ overflowY: 'auto', flex: 1 }}>
+                    {/* 현재 선택 — 상단 고정 */}
+                    <div style={{ fontSize: 11, fontWeight: 800, color: '#B5B0BC', marginBottom: 6, letterSpacing: '.3px' }}>현재 선택</div>
+                    <SwapCard
+                      name={placeName(swapItem)} partner={isPartner(swapItem)}
+                      rating={swapItem.placeRating ?? 4.0}
+                      lat={swapItem.lat} lng={swapItem.lng} placeId={swapItem.placeId}
+                      selected={true} onSelect={() => setPlacePickerId(null)}
+                    />
+                    {/* 근처 제휴 매장 */}
+                    {apiAlts.length > 0 && <div style={{ fontSize: 11, fontWeight: 800, color: '#B5B0BC', margin: '10px 0 6px', letterSpacing: '.3px' }}>근처 제휴 매장</div>}
+                    {apiAlts.map(c => (
+                      <SwapCard key={c.placeId} name={c.name} partner={true} rating={c.rating}
+                        lat={c.lat} lng={c.lng} placeId={c.placeId} selected={false}
+                        onSelect={() => selectPlace({ placeName: c.name, placeId: c.placeId, lat: c.lat, lng: c.lng, placeRating: c.rating, isPartner: true })}
+                      />
+                    ))}
+                    {/* 비제휴 목업 */}
+                    <div style={{ fontSize: 11, fontWeight: 800, color: '#B5B0BC', margin: '10px 0 6px', letterSpacing: '.3px' }}>비제휴 매장 (할인 제외)</div>
+                    {mockAlts.map(m => (
+                      <SwapCard key={m.name} name={m.name} partner={false} rating={m.rating}
+                        selected={swapItem.placeName === m.name && swapItem.isPartner === false}
+                        onSelect={() => selectPlace({ placeName: m.name, placeId: undefined, lat: undefined, lng: undefined, placeRating: m.rating, isPartner: false })}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </>
+            );
+          })()}
 
           {/* ══ REVIEW SCREEN ═════════════════════════════════════ */}
           {reviewOpen && (
