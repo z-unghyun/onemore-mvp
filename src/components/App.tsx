@@ -71,10 +71,19 @@ export default function App() {
   const [isRecommending, setIsRecommending] = useState(false);
   const [hasRecommended, setHasRecommended] = useState(false);
 
+  const [isMobile, setIsMobile] = useState(false);
+
   const toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const mapDragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
   const tlDragRef = useRef<{ id: number; mode: 'move' | 'resize'; startY: number; os: number; oe: number; moved: number } | null>(null);
   const tlScrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const check = () => setIsMobile(window.innerWidth < 768);
+    check();
+    window.addEventListener('resize', check);
+    return () => window.removeEventListener('resize', check);
+  }, []);
 
   const flash = useCallback((msg: string) => {
     setToast(msg);
@@ -225,27 +234,27 @@ export default function App() {
   // RENDER
   // ─────────────────────────────────────────────────────────────────
 
-  return (
-    <div style={{ minHeight: '100vh', width: '100%', background: '#EDE7EC', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32, fontFamily: "Pretendard,-apple-system,sans-serif" }}>
-      {/* Outer phone shell — #0E0E0C with 54px radius, 11px padding */}
-      <div style={{ position: 'relative', width: 390, height: 844, background: '#0E0E0C', borderRadius: 54, padding: 11, boxShadow: '0 50px 110px -30px rgba(60,20,40,.5), 0 0 0 2px rgba(0,0,0,.2)' }}>
-        {/* Inner screen — gradient, 44px radius */}
-        <div style={{ position: 'relative', width: '100%', height: '100%', background: 'linear-gradient(180deg,#FFE0EB 0%,#FCE7EC 26%,#F1EDF5 58%,#DCEBFF 100%)', borderRadius: 44, overflow: 'hidden' }}>
-
-          {/* status bar */}
-          <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 54, display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', padding: '0 30px 7px', zIndex: 60, pointerEvents: 'none' }}>
-            <div style={{ fontSize: 15, fontWeight: 800, color: '#16170F', letterSpacing: '-.3px' }}>9:41</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <div style={{ display: 'flex', alignItems: 'flex-end', gap: 2, height: 11 }}>
-                {[5, 7, 9, 11].map((h, i) => <span key={i} style={{ width: 3, height: h, background: '#16170F', borderRadius: 1, display: 'block' }} />)}
-              </div>
-              <div style={{ width: 15, height: 11, border: '1.6px solid #16170F', borderRadius: 3, position: 'relative' }}>
-                <span style={{ position: 'absolute', inset: 1.5, width: 7, background: '#16170F', borderRadius: 1 }} />
-              </div>
+  // ─── screen content (shared between desktop shell and mobile fullscreen) ─────
+  const screenContent = (
+    <>
+      {/* status bar — desktop mockup only */}
+      {!isMobile && (
+        <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 54, display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', padding: '0 30px 7px', zIndex: 60, pointerEvents: 'none' }}>
+          <div style={{ fontSize: 15, fontWeight: 800, color: '#16170F', letterSpacing: '-.3px' }}>9:41</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 2, height: 11 }}>
+              {[5, 7, 9, 11].map((h, i) => <span key={i} style={{ width: 3, height: h, background: '#16170F', borderRadius: 1, display: 'block' }} />)}
+            </div>
+            <div style={{ width: 15, height: 11, border: '1.6px solid #16170F', borderRadius: 3, position: 'relative' }}>
+              <span style={{ position: 'absolute', inset: 1.5, width: 7, background: '#16170F', borderRadius: 1 }} />
             </div>
           </div>
-          {/* notch */}
-          <div style={{ position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', width: 120, height: 34, background: '#0E0E0C', borderRadius: 20, zIndex: 70 }} />
+        </div>
+      )}
+      {/* notch — desktop mockup only */}
+      {!isMobile && (
+        <div style={{ position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)', width: 120, height: 34, background: '#0E0E0C', borderRadius: 20, zIndex: 70 }} />
+      )}
 
           {/* ══ HOME ══════════════════════════════════════════════ */}
           {tab === 'home' && (
@@ -982,7 +991,28 @@ export default function App() {
           {toast && (
             <div style={{ position: 'absolute', left: '50%', bottom: 108, transform: 'translateX(-50%)', background: '#16170F', color: '#fff', fontSize: 13, fontWeight: 800, padding: '11px 18px', borderRadius: 14, zIndex: 95, whiteSpace: 'nowrap', boxShadow: '0 14px 30px -12px rgba(0,0,0,.5)', animation: 'omUp .25s ease' }}>{toast}</div>
           )}
+    </>
+  );
 
+  return isMobile ? (
+    // ── Mobile: fullscreen, no shell ───────────────────────────────────────────
+    <div style={{
+      position: 'fixed', inset: 0,
+      background: 'linear-gradient(180deg,#FFE0EB 0%,#FCE7EC 26%,#F1EDF5 58%,#DCEBFF 100%)',
+      overflow: 'hidden', fontFamily: "Pretendard,-apple-system,sans-serif",
+      paddingTop: 'env(safe-area-inset-top)',
+      paddingBottom: 'env(safe-area-inset-bottom)',
+    }}>
+      <div style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
+        {screenContent}
+      </div>
+    </div>
+  ) : (
+    // ── Desktop: phone shell mockup ────────────────────────────────────────────
+    <div style={{ minHeight: '100vh', width: '100%', background: '#EDE7EC', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 32, fontFamily: "Pretendard,-apple-system,sans-serif" }}>
+      <div style={{ position: 'relative', width: 390, height: 844, background: '#0E0E0C', borderRadius: 54, padding: 11, boxShadow: '0 50px 110px -30px rgba(60,20,40,.5), 0 0 0 2px rgba(0,0,0,.2)' }}>
+        <div style={{ position: 'relative', width: '100%', height: '100%', background: 'linear-gradient(180deg,#FFE0EB 0%,#FCE7EC 26%,#F1EDF5 58%,#DCEBFF 100%)', borderRadius: 44, overflow: 'hidden' }}>
+          {screenContent}
         </div>
       </div>
     </div>
