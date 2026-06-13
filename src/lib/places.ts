@@ -150,12 +150,15 @@ export async function findNearest(
       business_status?: string;
     }> = data.results || [];
 
-    // OPERATIONAL only (excludes CLOSED_TEMPORARILY + CLOSED_PERMANENTLY)
-    // rating ≥ 4.0 + at least 10 reviews to filter ghost/empty listings
+    // OPERATIONAL only, rating ≥ 4.0, at least 10 reviews to filter ghost listings,
+    // and within 2 km of the search hub (rankby=distance has no radius cap, so a
+    // category with few local options could otherwise match a place 10+ km away).
+    const MAX_DIST_M = 2000;
     const match = results.find(p =>
       p.business_status === 'OPERATIONAL' &&
       (p.rating ?? 0) >= 4.0 &&
-      (p.user_ratings_total ?? 0) >= 10
+      (p.user_ratings_total ?? 0) >= 10 &&
+      approxWalkMins(hub, { lat: p.geometry.location.lat, lng: p.geometry.location.lng }) * 80 <= MAX_DIST_M
     );
     if (!match) return null;
 
