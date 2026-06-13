@@ -144,14 +144,18 @@ export async function findNearest(
       place_id: string;
       name: string;
       rating?: number;
+      user_ratings_total?: number;
       geometry: { location: { lat: number; lng: number } };
       photos?: Array<{ photo_reference: string }>;
       business_status?: string;
     }> = data.results || [];
 
+    // OPERATIONAL only (excludes CLOSED_TEMPORARILY + CLOSED_PERMANENTLY)
+    // rating ≥ 4.0 + at least 10 reviews to filter ghost/empty listings
     const match = results.find(p =>
+      p.business_status === 'OPERATIONAL' &&
       (p.rating ?? 0) >= 4.0 &&
-      p.business_status !== 'CLOSED_PERMANENTLY'
+      (p.user_ratings_total ?? 0) >= 10
     );
     if (!match) return null;
 
@@ -245,7 +249,11 @@ export async function nearbySearch(
       `/place/nearbysearch/json?location=${lat},${lng}&rankby=distance&type=${type}${kwParam}&language=ko`
     );
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (data.results || []).slice(0, 8).map((p: any) => ({
+    return (data.results || []).filter((p: any) =>
+      p.business_status === 'OPERATIONAL' &&
+      (p.rating ?? 0) >= 4.0 &&
+      (p.user_ratings_total ?? 0) >= 10
+    ).slice(0, 8).map((p: any) => ({
       placeId:    p.place_id,
       name:       cleanName(p.name),
       rating:     p.rating ?? 4.0,
