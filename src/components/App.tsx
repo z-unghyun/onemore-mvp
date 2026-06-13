@@ -46,6 +46,14 @@ const KIND_ICONS: Record<string, string> = { '식사': '🍴', '카페': '☕', 
 // ─── App ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  // survey mode: ?mode=survey 파라미터가 있으면 캘린더/마이 탭 숨김
+  const [surveyMode] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return new URLSearchParams(window.location.search).get('mode') === 'survey';
+    }
+    return false;
+  });
+
   // state mirrors the prototype exactly (tab starts on 'plan')
   const [mapPan, setMapPan] = useState({ x: 0, y: 0 });
   const [tab, setTab] = useState<'home' | 'plan' | 'calendar' | 'mypage'>('plan');
@@ -804,7 +812,7 @@ export default function App() {
           {/* ══ BOTTOM NAV ════════════════════════════════════════ */}
           {showNav && (
             <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 84, background: 'rgba(255,255,255,.92)', backdropFilter: 'blur(14px)', borderTop: '1px solid rgba(0,0,0,.04)', display: 'flex', alignItems: 'flex-start', padding: '10px 14px 0', zIndex: 55 }}>
-              {(['home','plan','calendar','mypage'] as const).map(key => {
+              {(['home','plan','calendar','mypage'] as const).filter(key => !surveyMode || (key === 'home' || key === 'plan')).map(key => {
                 const active = tab === key;
                 const c = active ? '#F0568C' : '#BBB6C2';
                 const bg = active ? '#FFD9E6' : 'transparent';
