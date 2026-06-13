@@ -808,7 +808,7 @@ export default function App() {
           )}
 
           {/* ══ BOTTOM NAV ════════════════════════════════════════ */}
-          {showNav && (
+          {showNav && !surveyMode && (
             <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 84, background: 'rgba(255,255,255,.92)', backdropFilter: 'blur(14px)', borderTop: '1px solid rgba(0,0,0,.04)', display: 'flex', alignItems: 'flex-start', padding: '10px 14px 0', zIndex: 55 }}>
               {(['home','plan','calendar','mypage'] as const).filter(key => !surveyMode || (key === 'home' || key === 'plan')).map(key => {
                 const active = tab === key;
