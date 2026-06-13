@@ -134,15 +134,18 @@ export default function App() {
   }, [tab, planStage]);
 
   // fetch swap candidates from Nearby Search
+  // If item has no placeName (notFound), search the whole kind pool (null category + kindFallback)
+  // so the user sees all nearby options sorted by distance.
   useEffect(() => {
     if (!placePickerId) { setSwapCandidates([]); return; }
     const it = items.find(i => i.id === placePickerId);
     if (!it) return;
-    const cat = it.category ?? CAT[it.kind][0];
+    const notFound = hasRecommended && !it.placeName;
+    const cat = notFound ? null : (it.category ?? CAT[it.kind][0]);
     // Use the current item's own coords as the search hub if available, otherwise region centre
     const coords = (it.lat && it.lng) ? { lat: it.lat, lng: it.lng } : REGION_COORDS[region];
     if (!coords) return;
-    nearbySearch(coords.lat, coords.lng, cat).then(r => { if (r.length) setSwapCandidates(r); });
+    nearbySearch(coords.lat, coords.lng, cat, it.kind).then(r => { if (r.length) setSwapCandidates(r); });
   }, [placePickerId, items, region]);
 
   // ── map pan ────────────────────────────────────────────────────
@@ -177,15 +180,32 @@ export default function App() {
       const dy = ev.clientY - d.startY;
       d.moved = Math.max(d.moved, Math.abs(dy));
       const dm = Math.round(dy / HOURH * 60 / 10) * 10;
-      setItems(prev => prev.map(i => {
-        if (i.id !== d.id) return i;
-        if (d.mode === 'move') {
-          const dur = d.oe - d.os;
-          const ns = Math.max(START, Math.min(ENDM - dur, d.os + dm));
-          return { ...i, start: ns, end: ns + dur };
-        }
-        return { ...i, end: Math.max(d.os + 30, Math.min(ENDM, d.oe + dm)) };
-      }));
+      setItems(prev => {
+        const others = prev.filter(i => i.id !== d.id);
+        return prev.map(i => {
+          if (i.id !== d.id) return i;
+          if (d.mode === 'move') {
+            const dur = d.oe - d.os;
+            let ns = Math.max(START, Math.min(ENDM - dur, d.os + dm));
+            // push away from overlapping items
+            for (const o of others) {
+              if (ns < o.end && ns + dur > o.start) {
+                const overlapFromTop = o.end - ns;
+                const overlapFromBottom = ns + dur - o.start;
+                ns = overlapFromTop < overlapFromBottom ? o.end : o.start - dur;
+              }
+            }
+            ns = Math.max(START, Math.min(ENDM - dur, ns));
+            return { ...i, start: ns, end: ns + dur };
+          }
+          let ne = Math.max(d.os + 30, Math.min(ENDM, d.oe + dm));
+          // don't resize into next item
+          for (const o of others) {
+            if (o.start >= d.os && ne > o.start) ne = o.start;
+          }
+          return { ...i, end: ne };
+        });
+      });
     };
     const onUp = () => {
       const d = tlDragRef.current; tlDragRef.current = null;
@@ -311,7 +331,7 @@ export default function App() {
               </div>
 
               {/* top date card */}
-              <div style={{ position: 'absolute', top: 60, left: 16, right: 16, display: 'flex', alignItems: 'center', gap: 10, zIndex: 20 }}>
+              <div style={{ position: 'absolute', top: isMobile ? 'calc(env(safe-area-inset-top) + 10px)' : 60, left: 16, right: 16, display: 'flex', alignItems: 'center', gap: 10, zIndex: 20 }}>
                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 11, background: '#fff', borderRadius: 18, padding: '12px 14px', boxShadow: '0 12px 30px -14px rgba(0,0,0,.28)' }}>
                   <span style={{ width: 24, height: 24, borderRadius: '50%', background: 'linear-gradient(135deg,#FF8FB8,#FF5C97)', flexShrink: 0, boxShadow: '0 0 0 4px #FFE2EC', display: 'block' }} />
                   <div style={{ minWidth: 0 }}>
@@ -370,21 +390,21 @@ export default function App() {
           {/* ══ PLAN BUILD ════════════════════════════════════════ */}
           {tab === 'plan' && planStage === 'build' && (
             <div style={{ position: 'absolute', inset: 0, paddingTop: isMobile ? 'env(safe-area-inset-top)' : 56, display: 'flex', flexDirection: 'column' }}>
-              <div style={{ padding: isMobile ? '8px 16px 8px' : '6px 20px 12px' }}>
-                <div style={{ textAlign: 'center', fontSize: isMobile ? 17 : 20, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px', marginBottom: isMobile ? 7 : 13 }}>코스 짜기</div>
+              <div style={{ padding: isMobile ? '10px 16px 10px' : '6px 20px 12px' }}>
+                <div style={{ textAlign: 'center', fontSize: isMobile ? 19 : 20, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px', marginBottom: isMobile ? 10 : 13 }}>코스 짜기</div>
                 {/* date picker */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#fff', borderRadius: 15, padding: isMobile ? '7px 10px' : '9px 11px', boxShadow: '0 8px 20px -12px rgba(0,0,0,.25)' }}>
-                  <button onClick={() => setDateIdx(d => Math.max(0, d-1))} style={{ width: 30, height: 30, border: 'none', background: '#FFE2EC', borderRadius: 10, fontSize: 17, color: '#F0568C', cursor: 'pointer', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>‹</button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#fff', borderRadius: 16, padding: isMobile ? '8px 10px' : '9px 11px', boxShadow: '0 8px 20px -12px rgba(0,0,0,.25)' }}>
+                  <button onClick={() => setDateIdx(d => Math.max(0, d-1))} style={{ width: 32, height: 32, border: 'none', background: '#FFE2EC', borderRadius: 10, fontSize: 17, color: '#F0568C', cursor: 'pointer', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>‹</button>
                   <div style={{ flex: 1, textAlign: 'center', fontWeight: 800, fontSize: 15, color: '#16170F' }}>{date}</div>
-                  <button onClick={() => setDateIdx(d => Math.min(2, d+1))} style={{ width: 30, height: 30, border: 'none', background: '#FFE2EC', borderRadius: 10, fontSize: 17, color: '#F0568C', cursor: 'pointer', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>›</button>
+                  <button onClick={() => setDateIdx(d => Math.min(2, d+1))} style={{ width: 32, height: 32, border: 'none', background: '#FFE2EC', borderRadius: 10, fontSize: 17, color: '#F0568C', cursor: 'pointer', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>›</button>
                 </div>
                 {/* region row */}
-                <div style={{ display: 'flex', gap: 8, marginTop: 7 }}>
-                  <button onClick={() => setShowSearch(true)} style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#fff', border: '1px solid rgba(0,0,0,.05)', borderRadius: 13, padding: isMobile ? '9px 12px' : '12px 15px', fontWeight: 800, fontSize: 13, color: '#16170F', cursor: 'pointer', flexShrink: 0, boxShadow: '0 6px 16px -12px rgba(0,0,0,.3)' }}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FF5C97" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
+                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                  <button onClick={() => setShowSearch(true)} style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#fff', border: '1px solid rgba(0,0,0,.05)', borderRadius: 14, padding: isMobile ? '11px 13px' : '12px 15px', fontWeight: 800, fontSize: 13.5, color: '#16170F', cursor: 'pointer', flexShrink: 0, boxShadow: '0 6px 16px -12px rgba(0,0,0,.3)' }}>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#FF5C97" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
                     장소 선택
                   </button>
-                  <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, background: '#fff', border: '1px solid rgba(0,0,0,.05)', borderRadius: 13, padding: '0 13px', fontWeight: 800, fontSize: 13.5, color: '#16170F', boxShadow: '0 6px 16px -12px rgba(0,0,0,.3)', minHeight: isMobile ? 42 : 48 }}>
+                  <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, background: '#fff', border: '1px solid rgba(0,0,0,.05)', borderRadius: 14, padding: '0 14px', fontWeight: 800, fontSize: 13.5, color: '#16170F', boxShadow: '0 6px 16px -12px rgba(0,0,0,.3)', minHeight: isMobile ? 46 : 48 }}>
                     <span style={{ width: 11, height: 11, borderRadius: '50%', background: '#FF5C97', flexShrink: 0, display: 'block' }} />
                     <span style={{ whiteSpace: 'nowrap' }}>{region}</span>
                     <span style={{ marginLeft: 'auto', fontSize: 12, color: '#B5B0BC', fontWeight: 700, flexShrink: 0, whiteSpace: 'nowrap' }}>서울</span>
@@ -448,12 +468,56 @@ export default function App() {
 
               {/* toolbar */}
               <div style={{ padding: '10px 18px 0', background: 'linear-gradient(to top,#EAEAF4 72%,rgba(234,234,244,0))' }}>
-                <div style={{ textAlign: 'center', fontSize: 11.5, color: '#A7A2B0', fontWeight: 700, marginBottom: 9 }}>드래그 앤 드롭으로 추가</div>
                 <div style={{ display: 'flex', gap: 9, marginBottom: 11 }}>
                   {(['식사','카페','놀거리'] as const).map(kind => {
                     const k = KIND[kind];
                     return (
-                      <div key={kind} draggable onDragStart={e => { e.dataTransfer.setData('text/plain', kind); e.dataTransfer.setData('kind', kind); e.dataTransfer.effectAllowed = 'copy'; }} onClick={() => setItems(prev => { const s = firstFreeSlot(prev); return [...prev, { id: Date.now(), kind, category: null, start: s, end: s+90, placeIdx: 0 }]; })} style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, padding: '14px 8px', background: '#fff', borderRadius: 16, boxShadow: '0 6px 16px -10px rgba(0,0,0,.28)', cursor: 'grab', fontWeight: 800, fontSize: 14, color: '#16170F', userSelect: 'none' }}>
+                      <div
+                        key={kind}
+                        draggable
+                        onDragStart={e => { e.dataTransfer.setData('text/plain', kind); e.dataTransfer.setData('kind', kind); e.dataTransfer.effectAllowed = 'copy'; }}
+                        onPointerDown={e => {
+                          if (!isMobile) return;
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                          const startY = e.clientY;
+                          let ghost: HTMLDivElement | null = null;
+                          let moved = false;
+                          const onMove = (ev: PointerEvent) => {
+                            if (!moved && Math.abs(ev.clientY - startY) > 6) moved = true;
+                            if (!moved) return;
+                            if (!ghost) {
+                              ghost = document.createElement('div');
+                              ghost.textContent = kind;
+                              Object.assign(ghost.style, { position:'fixed', pointerEvents:'none', zIndex:'9999', background:'#FF5C97', color:'#fff', fontWeight:'800', padding:'10px 18px', borderRadius:'14px', fontSize:'15px', transform:'translate(-50%,-50%)', opacity:'0.85' });
+                              document.body.appendChild(ghost);
+                            }
+                            ghost.style.left = ev.clientX + 'px';
+                            ghost.style.top = ev.clientY + 'px';
+                          };
+                          const onUp = (ev: PointerEvent) => {
+                            window.removeEventListener('pointermove', onMove);
+                            window.removeEventListener('pointerup', onUp);
+                            ghost?.remove();
+                            if (!moved) {
+                              // tap: add to first free slot
+                              setItems(prev => { const s = firstFreeSlot(prev); return [...prev, { id: Date.now(), kind, category: null, start: s, end: s+90, placeIdx: 0 }]; });
+                              return;
+                            }
+                            // drop: find timeline position
+                            const tl = tlScrollRef.current;
+                            if (!tl) return;
+                            const rect = tl.getBoundingClientRect();
+                            if (ev.clientX < rect.left || ev.clientX > rect.right || ev.clientY < rect.top || ev.clientY > rect.bottom) return;
+                            const y = ev.clientY - rect.top + tl.scrollTop;
+                            const s = Math.round(Math.max(START, Math.min(ENDM-90, START + y/HOURH*60)) / 10) * 10;
+                            setItems(prev => [...prev, { id: Date.now(), kind, category: null, start: s, end: s+90, placeIdx: 0 }]);
+                          };
+                          window.addEventListener('pointermove', onMove);
+                          window.addEventListener('pointerup', onUp);
+                        }}
+                        onClick={!isMobile ? () => setItems(prev => { const s = firstFreeSlot(prev); return [...prev, { id: Date.now(), kind, category: null, start: s, end: s+90, placeIdx: 0 }]; }) : undefined}
+                        style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, padding: '14px 8px', background: '#fff', borderRadius: 16, boxShadow: '0 6px 16px -10px rgba(0,0,0,.28)', cursor: 'grab', fontWeight: 800, fontSize: 14, color: '#16170F', userSelect: 'none', touchAction: 'none' }}
+                      >
                         <span style={{ width: 24, height: 24, borderRadius: 8, background: k.tint, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 13 }}>{KIND_ICONS[kind]}</span>
                         {kind}
                       </div>
@@ -812,7 +876,7 @@ export default function App() {
                     {CAT[it.kind].map(cat => {
                       const selected = it.category === cat;
                       return (
-                        <div key={cat} onClick={() => { setItems(prev => prev.map(i => i.id === catPickerId ? { ...i, category: cat, placeIdx: 0 } : i)); setCatPickerId(null); }} style={{ padding: '13px 20px', borderRadius: 30, fontSize: 15, fontWeight: 800, cursor: 'pointer', background: selected ? '#16170F' : '#fff', color: selected ? '#fff' : '#16170F', boxShadow: '0 8px 18px -12px rgba(0,0,0,.25)' }}>
+                        <div key={cat} onClick={() => { setItems(prev => prev.map(i => i.id === catPickerId ? { ...i, category: selected ? null : cat, placeIdx: 0 } : i)); setCatPickerId(null); }} style={{ padding: '13px 20px', borderRadius: 30, fontSize: 15, fontWeight: 800, cursor: 'pointer', background: selected ? '#16170F' : '#fff', color: selected ? '#fff' : '#16170F', boxShadow: '0 8px 18px -12px rgba(0,0,0,.25)' }}>
                           {cat}
                         </div>
                       );
@@ -889,9 +953,14 @@ export default function App() {
               <>
                 <div onClick={() => setPlacePickerId(null)} style={{ position: 'absolute', inset: 0, background: 'rgba(30,14,22,.42)', zIndex: 84 }} />
                 <div onClick={e => e.stopPropagation()} style={{ position: 'absolute', left: 0, right: 0, bottom: 0, background: '#FBF7F9', borderRadius: '30px 30px 0 0', zIndex: 85, padding: '12px 18px 30px', maxHeight: '80%', display: 'flex', flexDirection: 'column', animation: 'omUp .28s ease' }}>
+                  {(() => { const swapNotFound = hasRecommended && !swapItem.placeName; return (<>
                   <div style={{ width: 42, height: 5, borderRadius: 3, background: '#E2DCE5', margin: '2px auto 16px' }} />
-                  <div style={{ fontSize: 19, fontWeight: 800, color: '#16170F', marginBottom: 3 }}>{placePickerCat} 다른 곳</div>
-                  <div style={{ fontSize: 12.5, color: '#9A96A0', fontWeight: 700, marginBottom: 10 }}>제휴 매장을 고르면 번들 할인이 유지돼요</div>
+                  <div style={{ fontSize: 19, fontWeight: 800, color: '#16170F', marginBottom: 3 }}>
+                    {swapNotFound ? `가까운 ${swapItem.kind}` : `${placePickerCat} 다른 곳`}
+                  </div>
+                  <div style={{ fontSize: 12.5, color: '#9A96A0', fontWeight: 700, marginBottom: 10 }}>
+                    {swapNotFound ? '거리 순으로 정렬됐어요. 제휴 매장을 고르면 할인이 적용돼요' : '제휴 매장을 고르면 번들 할인이 유지돼요'}
+                  </div></>); })()}
                   <div style={{ display: 'flex', alignItems: 'center', gap: 7, background: '#FFF0F5', borderRadius: 13, padding: '10px 13px', marginBottom: 14, flexShrink: 0 }}>
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#F0568C" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 8v5M12 16h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
                     <span style={{ fontSize: 11.5, color: '#C44E7E', fontWeight: 700 }}>비제휴 매장을 고르면 그 장소는 할인에서 빠져요</span>

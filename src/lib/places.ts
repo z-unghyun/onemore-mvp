@@ -262,10 +262,11 @@ export async function getWalkingTimes(
 
 export async function nearbySearch(
   lat: number, lng: number,
-  category: string,
+  category: string | null,
+  kindFallback?: string,
 ): Promise<PlaceCandidate[]> {
   try {
-    const mapped = CAT_PARAMS[category];
+    const mapped = category ? CAT_PARAMS[category] : (kindFallback ? KIND_DEFAULT[kindFallback] : null);
     const type = mapped?.type ?? 'restaurant';
     const kw = mapped?.keyword ?? '';
     const kwParam = kw ? `&keyword=${encodeURIComponent(kw)}` : '';
