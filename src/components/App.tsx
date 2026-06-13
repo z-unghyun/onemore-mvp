@@ -475,7 +475,7 @@ export default function App() {
               </div>
 
               {/* toolbar */}
-              <div style={{ padding: '10px 18px 0', background: 'linear-gradient(to top,#EAEAF4 72%,rgba(234,234,244,0))' }}>
+              {!surveyMode && <div style={{ padding: '10px 18px 0', background: 'linear-gradient(to top,#EAEAF4 72%,rgba(234,234,244,0))' }}>
                 <div style={{ display: 'flex', gap: 9, marginBottom: 11 }}>
                   {(['식사','카페','놀거리'] as const).map(kind => {
                     const k = KIND[kind];
@@ -532,7 +532,7 @@ export default function App() {
                     );
                   })}
                 </div>
-              </div>
+              </div>}
               <div style={{ padding: '0 18px 92px' }}>
                 <button
                   disabled={isRecommending}
