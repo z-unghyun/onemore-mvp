@@ -46,9 +46,10 @@ const KIND_ICONS: Record<string, string> = { '식사': '🍴', '카페': '☕', 
 // ─── App ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  // survey mode: ?mode=survey 파라미터가 있으면 캘린더/마이 탭 숨김
-  const [surveyMode, setSurveyMode] = useState(false);
+  // survey mode: ?mode=survey 파라미터 또는 NEXT_PUBLIC_SURVEY_MODE 환경변수가 있으면 캘린더/마이 탭·툴바·네비바 숨김
+  const [surveyMode, setSurveyMode] = useState(process.env.NEXT_PUBLIC_SURVEY_MODE === 'true');
   useEffect(() => {
+    if (process.env.NEXT_PUBLIC_SURVEY_MODE === 'true') return;
     setSurveyMode(new URLSearchParams(window.location.search).get('mode') === 'survey');
   }, []);
 
