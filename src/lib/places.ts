@@ -178,6 +178,7 @@ export async function findNearest(
     const match = results.find(p =>
       p.business_status !== 'CLOSED_TEMPORARILY' &&
       p.business_status !== 'CLOSED_PERMANENTLY' &&
+      !(p as Record<string, unknown>)['permanently_closed'] &&
       (p.rating ?? 0) >= 4.0 &&
       (p.user_ratings_total ?? 0) >= 10 &&
       haversineDist(hub, { lat: p.geometry.location.lat, lng: p.geometry.location.lng }) <= MAX_DIST_M
@@ -277,6 +278,7 @@ export async function nearbySearch(
     return (data.results || []).filter((p: any) =>
       p.business_status !== 'CLOSED_TEMPORARILY' &&
       p.business_status !== 'CLOSED_PERMANENTLY' &&
+      !p.permanently_closed &&
       (p.rating ?? 0) >= 4.0 &&
       (p.user_ratings_total ?? 0) >= 10
     ).slice(0, 8).map((p: any) => ({
