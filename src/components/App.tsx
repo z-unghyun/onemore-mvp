@@ -369,22 +369,22 @@ export default function App() {
 
           {/* ══ PLAN BUILD ════════════════════════════════════════ */}
           {tab === 'plan' && planStage === 'build' && (
-            <div style={{ position: 'absolute', inset: 0, paddingTop: 56, display: 'flex', flexDirection: 'column' }}>
-              <div style={{ padding: '6px 20px 12px' }}>
-                <div style={{ textAlign: 'center', fontSize: 20, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px', marginBottom: 13 }}>코스 짜기</div>
+            <div style={{ position: 'absolute', inset: 0, paddingTop: isMobile ? 'env(safe-area-inset-top)' : 56, display: 'flex', flexDirection: 'column' }}>
+              <div style={{ padding: isMobile ? '8px 16px 8px' : '6px 20px 12px' }}>
+                <div style={{ textAlign: 'center', fontSize: isMobile ? 17 : 20, fontWeight: 800, color: '#16170F', letterSpacing: '-.5px', marginBottom: isMobile ? 7 : 13 }}>코스 짜기</div>
                 {/* date picker */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#fff', borderRadius: 18, padding: '9px 11px', boxShadow: '0 8px 20px -12px rgba(0,0,0,.25)' }}>
-                  <button onClick={() => setDateIdx(d => Math.max(0, d-1))} style={{ width: 34, height: 34, border: 'none', background: '#FFE2EC', borderRadius: 11, fontSize: 17, color: '#F0568C', cursor: 'pointer', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>‹</button>
-                  <div style={{ flex: 1, textAlign: 'center', fontWeight: 800, fontSize: 16, color: '#16170F' }}>{date}</div>
-                  <button onClick={() => setDateIdx(d => Math.min(2, d+1))} style={{ width: 34, height: 34, border: 'none', background: '#FFE2EC', borderRadius: 11, fontSize: 17, color: '#F0568C', cursor: 'pointer', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>›</button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#fff', borderRadius: 15, padding: isMobile ? '7px 10px' : '9px 11px', boxShadow: '0 8px 20px -12px rgba(0,0,0,.25)' }}>
+                  <button onClick={() => setDateIdx(d => Math.max(0, d-1))} style={{ width: 30, height: 30, border: 'none', background: '#FFE2EC', borderRadius: 10, fontSize: 17, color: '#F0568C', cursor: 'pointer', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>‹</button>
+                  <div style={{ flex: 1, textAlign: 'center', fontWeight: 800, fontSize: 15, color: '#16170F' }}>{date}</div>
+                  <button onClick={() => setDateIdx(d => Math.min(2, d+1))} style={{ width: 30, height: 30, border: 'none', background: '#FFE2EC', borderRadius: 10, fontSize: 17, color: '#F0568C', cursor: 'pointer', fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>›</button>
                 </div>
                 {/* region row */}
-                <div style={{ display: 'flex', gap: 9, marginTop: 9 }}>
-                  <button onClick={() => setShowSearch(true)} style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#fff', border: '1px solid rgba(0,0,0,.05)', borderRadius: 15, padding: '12px 15px', fontWeight: 800, fontSize: 13.5, color: '#16170F', cursor: 'pointer', flexShrink: 0, boxShadow: '0 6px 16px -12px rgba(0,0,0,.3)' }}>
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#FF5C97" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
+                <div style={{ display: 'flex', gap: 8, marginTop: 7 }}>
+                  <button onClick={() => setShowSearch(true)} style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#fff', border: '1px solid rgba(0,0,0,.05)', borderRadius: 13, padding: isMobile ? '9px 12px' : '12px 15px', fontWeight: 800, fontSize: 13, color: '#16170F', cursor: 'pointer', flexShrink: 0, boxShadow: '0 6px 16px -12px rgba(0,0,0,.3)' }}>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FF5C97" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></svg>
                     장소 선택
                   </button>
-                  <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, background: '#fff', border: '1px solid rgba(0,0,0,.05)', borderRadius: 15, padding: '0 15px', fontWeight: 800, fontSize: 14, color: '#16170F', boxShadow: '0 6px 16px -12px rgba(0,0,0,.3)' }}>
+                  <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, background: '#fff', border: '1px solid rgba(0,0,0,.05)', borderRadius: 13, padding: '0 13px', fontWeight: 800, fontSize: 13.5, color: '#16170F', boxShadow: '0 6px 16px -12px rgba(0,0,0,.3)', minHeight: isMobile ? 42 : 48 }}>
                     <span style={{ width: 11, height: 11, borderRadius: '50%', background: '#FF5C97', flexShrink: 0, display: 'block' }} />
                     <span style={{ whiteSpace: 'nowrap' }}>{region}</span>
                     <span style={{ marginLeft: 'auto', fontSize: 12, color: '#B5B0BC', fontWeight: 700, flexShrink: 0, whiteSpace: 'nowrap' }}>서울</span>
@@ -760,8 +760,8 @@ export default function App() {
             </div>
           )}
 
-          {/* home indicator */}
-          <div style={{ position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)', width: 130, height: 5, borderRadius: 3, background: '#16170F', opacity: .85, zIndex: 56 }} />
+          {/* home indicator — desktop mockup only */}
+          {!isMobile && <div style={{ position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)', width: 130, height: 5, borderRadius: 3, background: '#16170F', opacity: .85, zIndex: 56 }} />}
 
           {/* ══ PLACE SEARCH SHEET ════════════════════════════════ */}
           {showSearch && (
